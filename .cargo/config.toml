@@ -1,0 +1,13 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+runner = "scripts/qemu-run.sh"
+rustflags = [
+    "-C", "force-frame-pointers=yes",
+    "-C", "link-arg=--nmagic",
+]
+
+[alias]
+hw = "build --release --no-default-features"
+qemu = "run --features qemu"

@@ -1,0 +1,30 @@
+[package]
+name = "ArmOS"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[features]
+# Enable for `cargo run` (QEMU semihosting I/O). Disable for on-target flashing:
+#   cargo build --release --no-default-features
+default = ["qemu"]
+qemu = []
+probe-panic = ["dep:panic-probe", "dep:cortex-m"]
+
+[dependencies]
+cortex-m = { version = "0.7", optional = true }
+panic-probe = { version = "0.3", optional = true }
+
+[profile.dev]
+panic = "abort"
+debug-assertions = false
+overflow-checks = false
+
+[profile.release]
+panic = "abort"
+
+[[bin]]
+name = "ArmOS"
+path = "src/main.rs"
+test = false
+bench = false
