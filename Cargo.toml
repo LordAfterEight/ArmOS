@@ -11,9 +11,13 @@ default = ["qemu"]
 qemu = []
 probe-panic = ["dep:panic-probe", "dep:cortex-m"]
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 cortex-m = { version = "0.7", optional = true }
 panic-probe = { version = "0.3", optional = true }
+spin = "0.12.1"
 
 [profile.dev]
 panic = "abort"

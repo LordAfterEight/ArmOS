@@ -1,23 +1,27 @@
 #![no_std]
 #![no_main]
 
-mod board;
-mod hal;
+extern crate ArmOS;
+
 mod panic;
 mod startup;
-
-use hal::uart;
 
 #[cfg(feature = "probe-panic")]
 use panic_probe as _;
 
 #[unsafe(no_mangle)]
 fn main() -> ! {
-    uart::init();
-    uart::write_str("ArmOS: boot ok\r\n");
+    ArmOS::drivers::serial::init();
+    ArmOS::println!("ArmOS: boot ok");
+
+    let mut scheduler = ArmOS::proc::csched::CooperativeScheduler::init();
+    match scheduler.start() {
+        Ok(_) => unreachable!("Scheduler only returns on error"),
+        Err(e) => ArmOS::println!("Scheduler exited: {e:#?}")
+    }
 
     #[cfg(feature = "qemu")]
-    crate::hal::semihost::exit(0);
+    ArmOS::hal::semihost::exit(0);
 
     #[cfg(not(feature = "qemu"))]
     loop {
