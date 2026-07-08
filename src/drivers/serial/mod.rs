@@ -8,7 +8,7 @@ use core::fmt::Write;
 use crate::hal::uart;
 
 /// USART1 peripheral base (STM32H745). Role-equivalent to x86 `COM1`.
-pub const PORT: usize = crate::hal::regs::USART1_BASE;
+pub const PORT: usize = 0x4001_1000;
 
 pub struct Serial;
 

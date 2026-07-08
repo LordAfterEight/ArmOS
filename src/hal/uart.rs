@@ -2,12 +2,15 @@
 
 use core::fmt::{self, Write};
 
-use crate::board::{self, GpioPin};
+#[cfg(not(feature = "qemu"))]
+use crate::board;
 
+#[cfg(not(feature = "qemu"))]
 use super::clock;
-use super::regs::{
-    gpio, modify_reg, rcc, usart, write_reg, GpioId, RCC_BASE, USART1_BASE,
-};
+#[cfg(not(feature = "qemu"))]
+use super::gpio;
+#[cfg(not(feature = "qemu"))]
+use super::pac::{self, device};
 
 #[cfg(feature = "qemu")]
 use super::semihost;
@@ -33,43 +36,20 @@ pub fn init() {
 
 #[cfg(not(feature = "qemu"))]
 fn init_hw() {
-    enable_gpio_clock(board::USART1_TX.port);
-    enable_usart1_clock();
-    configure_pin(&board::USART1_TX);
-    configure_pin(&board::USART1_RX);
-    configure_usart1();
-}
+    // Single-core bring-up: steal after reset (no allocator/concurrency yet).
+    let dp = unsafe { device::Peripherals::steal() };
 
-fn enable_gpio_clock(port: GpioId) {
-    if port.base == crate::hal::regs::GPIOA_BASE {
-        modify_reg(RCC_BASE, rcc::AHB4ENR, rcc::GPIOAEN, rcc::GPIOAEN);
-    }
-}
+    dp.RCC.ahb4enr().modify(|_, w| w.gpioaen().set_bit());
+    dp.RCC.apb2enr().modify(|_, w| w.usart1en().set_bit());
 
-fn enable_usart1_clock() {
-    modify_reg(RCC_BASE, rcc::APB2ENR, rcc::USART1EN, rcc::USART1EN);
-}
+    gpio::configure_af_pin(&dp.GPIOA, &board::USART1_TX);
+    gpio::configure_af_pin(&dp.GPIOA, &board::USART1_RX);
 
-fn configure_pin(pin: &GpioPin) {
-    let n = pin.pin as u32;
-    let moder_shift = n * 2;
-    modify_reg(pin.port.base, gpio::MODER, 0x3 << moder_shift, 0x2 << moder_shift);
-
-    let afr_idx = (n / 8) as usize;
-    let afr_shift = (n % 8) * 4;
-    modify_reg(
-        pin.port.base,
-        gpio::AFR[afr_idx],
-        0xF << afr_shift,
-        (pin.alternate as u32) << afr_shift,
-    );
-}
-
-fn configure_usart1() {
     let pclk = clock::pclk2_hz();
     let brr = (pclk + (board::UART_BAUD / 2)) / board::UART_BAUD;
-    write_reg(USART1_BASE, usart::BRR, brr);
-    write_reg(USART1_BASE, usart::CR1, usart::UE | usart::TE);
+
+    dp.USART1.brr().write(|w| unsafe { w.brr().bits(brr as u16) });
+    dp.USART1.cr1().write(|w| w.ue().set_bit().te().set_bit());
 }
 
 pub fn write_str(s: &str) {
@@ -91,8 +71,9 @@ pub fn write_byte(b: u8) {
 
     #[cfg(not(feature = "qemu"))]
     {
-        while super::regs::read_reg(USART1_BASE, usart::ISR) & usart::TXE == 0 {}
-        write_reg(USART1_BASE, usart::TDR, b as u32);
+        let usart1 = pac::usart1();
+        while usart1.isr().read().txe().bit_is_clear() {}
+        usart1.tdr().write(|w| unsafe { w.tdr().bits(b as u16) });
     }
 }
 

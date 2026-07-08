@@ -37,3 +37,5 @@ pub mod drivers;
 pub mod hal;
 pub mod klog;
 pub mod proc;
+pub mod apps;
+pub mod kui;

@@ -16,8 +16,10 @@ path = "src/lib.rs"
 
 [dependencies]
 cortex-m = { version = "0.7", optional = true }
+fontdue = "0.9.3"
 panic-probe = { version = "0.3", optional = true }
 spin = "0.12.1"
+stm32h7 = { version = "0.16.0", default-features = false, features = ["stm32h745cm7"] }
 
 [profile.dev]
 panic = "abort"
