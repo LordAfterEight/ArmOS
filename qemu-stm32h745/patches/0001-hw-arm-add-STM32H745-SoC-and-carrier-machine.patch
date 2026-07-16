@@ -1,0 +1,1359 @@
+From 187a911a53a42d7e2ecf04b12c3a42f5e87a8052 Mon Sep 17 00:00:00 2001
+From: LordAfterEight <elias@stettmayer.de>
+Date: Thu, 16 Jul 2026 20:10:33 +0200
+Subject: [PATCH 1/2] hw/arm: add STM32H745 SoC and carrier machine
+
+Introduce stm32h745-carrier for a custom STM32H745BIT6 board:
+Cortex-M7, 2 MiB flash, internal SRAMs, 64 MiB FMC SDRAM window,
+minimal H7 RCC/GPIO/USART1 for Rust ArmOS bring-up.
+---
+ hw/arm/Kconfig                  |  13 ++
+ hw/arm/meson.build              |   2 +
+ hw/arm/stm32h745_carrier.c      |  58 +++++++
+ hw/arm/stm32h745_soc.c          | 245 ++++++++++++++++++++++++++++
+ hw/char/Kconfig                 |   3 +
+ hw/char/meson.build             |   1 +
+ hw/char/stm32h7_usart.c         | 277 ++++++++++++++++++++++++++++++++
+ hw/gpio/Kconfig                 |   3 +
+ hw/gpio/meson.build             |   1 +
+ hw/gpio/stm32h7_gpio.c          | 190 ++++++++++++++++++++++
+ hw/misc/Kconfig                 |   3 +
+ hw/misc/meson.build             |   1 +
+ hw/misc/stm32h7_rcc.c           | 142 ++++++++++++++++
+ include/hw/arm/stm32h745_soc.h  |  72 +++++++++
+ include/hw/char/stm32h7_usart.h |  63 ++++++++
+ include/hw/gpio/stm32h7_gpio.h  |  49 ++++++
+ include/hw/misc/stm32h7_rcc.h   |  54 +++++++
+ 17 files changed, 1177 insertions(+)
+ create mode 100644 hw/arm/stm32h745_carrier.c
+ create mode 100644 hw/arm/stm32h745_soc.c
+ create mode 100644 hw/char/stm32h7_usart.c
+ create mode 100644 hw/gpio/stm32h7_gpio.c
+ create mode 100644 hw/misc/stm32h7_rcc.c
+ create mode 100644 include/hw/arm/stm32h745_soc.h
+ create mode 100644 include/hw/char/stm32h7_usart.h
+ create mode 100644 include/hw/gpio/stm32h7_gpio.h
+ create mode 100644 include/hw/misc/stm32h7_rcc.h
+
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 2aa4b5d..2c71c5b 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -426,6 +426,19 @@ config STM32L4X5_SOC
+     select STM32L4X5_GPIO
+     select STM32L4X5_USART
+ 
++config STM32H745_CARRIER
++    bool
++    default y
++    depends on TCG && ARM
++    select STM32H745_SOC
++
++config STM32H745_SOC
++    bool
++    select ARM_V7M
++    select STM32H7_RCC
++    select STM32H7_GPIO
++    select STM32H7_USART
++
+ config XLNX_ZYNQMP_ARM
+     bool
+     default y if PIXMAN
+diff --git a/hw/arm/meson.build b/hw/arm/meson.build
+index dc68391..9538241 100644
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -35,6 +35,8 @@ arm_common_ss.add(when: 'CONFIG_STM32F205_SOC', if_true: files('stm32f205_soc.c'
+ arm_common_ss.add(when: 'CONFIG_STM32F405_SOC', if_true: files('stm32f405_soc.c'))
+ arm_common_ss.add(when: 'CONFIG_B_L475E_IOT01A', if_true: files('b-l475e-iot01a.c'))
+ arm_common_ss.add(when: 'CONFIG_STM32L4X5_SOC', if_true: files('stm32l4x5_soc.c'))
++arm_common_ss.add(when: 'CONFIG_STM32H745_SOC', if_true: files('stm32h745_soc.c'))
++arm_common_ss.add(when: 'CONFIG_STM32H745_CARRIER', if_true: files('stm32h745_carrier.c'))
+ arm_common_ss.add(when: 'CONFIG_XLNX_ZYNQMP_ARM', if_true: files('xlnx-zynqmp.c', 'xlnx-zcu102.c'))
+ arm_common_ss.add(when: 'CONFIG_XLNX_VERSAL', if_true: files('xlnx-versal.c', 'xlnx-versal-virt.c'))
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX25', if_true: files('fsl-imx25.c', 'imx25_pdk.c'))
+diff --git a/hw/arm/stm32h745_carrier.c b/hw/arm/stm32h745_carrier.c
+new file mode 100644
+index 0000000..a0647e2
+--- /dev/null
++++ b/hw/arm/stm32h745_carrier.c
+@@ -0,0 +1,58 @@
++/*
++ * Custom STM32H745BIT6 MCU carrier board
++ *
++ * - 8 MHz HSE on OSC_IN (PH0)
++ * - 64 MiB FMC SDRAM (AS4C32M16SB) at 0xC0000000
++ * - Console: USART1 (chardev serial0)
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/boards.h"
++#include "hw/qdev-clock.h"
++#include "hw/qdev-properties.h"
++#include "hw/arm/stm32h745_soc.h"
++#include "hw/arm/boot.h"
++#include "qemu/error-report.h"
++
++/* HSI default 64 MHz until guest programs PLLs. */
++#define SYSCLK_FRQ 64000000ULL
++#define HSE_FRQ    8000000ULL
++
++static void stm32h745_carrier_init(MachineState *machine)
++{
++    DeviceState *dev;
++    Clock *sysclk;
++
++    sysclk = clock_new(OBJECT(machine), "SYSCLK");
++    clock_set_hz(sysclk, SYSCLK_FRQ);
++
++    dev = qdev_new(TYPE_STM32H745_SOC);
++    object_property_add_child(OBJECT(machine), "soc", OBJECT(dev));
++    qdev_prop_set_uint32(dev, "hse-frequency", HSE_FRQ);
++    qdev_prop_set_uint64(dev, "sdram-size", STM32H745_SDRAM_SIZE);
++    qdev_connect_clock_in(dev, "sysclk", sysclk);
++    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
++
++    armv7m_load_kernel(STM32H745_SOC(dev)->armv7m.cpu,
++                       machine->kernel_filename,
++                       STM32H745_FLASH_BASE,
++                       STM32H745_FLASH_SIZE);
++}
++
++static void stm32h745_carrier_machine_init(MachineClass *mc)
++{
++    static const char *const valid_cpu_types[] = {
++        ARM_CPU_TYPE_NAME("cortex-m7"),
++        NULL
++    };
++
++    mc->desc = "STM32H745BIT6 custom carrier (Cortex-M7)";
++    mc->init = stm32h745_carrier_init;
++    mc->valid_cpu_types = valid_cpu_types;
++    mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m7");
++}
++
++DEFINE_MACHINE("stm32h745-carrier", stm32h745_carrier_machine_init)
+diff --git a/hw/arm/stm32h745_soc.c b/hw/arm/stm32h745_soc.c
+new file mode 100644
+index 0000000..0a10051
+--- /dev/null
++++ b/hw/arm/stm32h745_soc.c
+@@ -0,0 +1,245 @@
++/*
++ * STM32H745 SoC
++ *
++ * Cortex-M7 + flash/SRAM map + RCC + GPIO + USART1.
++ * Carrier board attaches SDRAM size / HSE via properties.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "system/address-spaces.h"
++#include "system/system.h"
++#include "hw/arm/stm32h745_soc.h"
++#include "hw/qdev-clock.h"
++#include "hw/qdev-properties.h"
++#include "hw/misc/unimp.h"
++#include "qemu/module.h"
++
++static const hwaddr gpio_addr[STM32H745_NUM_GPIO] = {
++    0x58020000, /* A */
++    0x58020400, /* B */
++    0x58020800, /* C */
++    0x58020C00, /* D */
++    0x58021000, /* E */
++    0x58021400, /* F */
++    0x58021800, /* G */
++    0x58021C00, /* H */
++    0x58022000, /* I */
++    0x58022400, /* J */
++    0x58022800, /* K */
++};
++
++static const char *gpio_name[STM32H745_NUM_GPIO] = {
++    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"
++};
++
++/* GPIOA debug pins reset closer to silicon; others default analog. */
++static const uint32_t gpio_moder_reset[STM32H745_NUM_GPIO] = {
++    0xABFFFFFF, /* A */
++    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++};
++
++static void stm32h745_soc_initfn(Object *obj)
++{
++    STM32H745State *s = STM32H745_SOC(obj);
++    int i;
++
++    object_initialize_child(obj, "armv7m", &s->armv7m, TYPE_ARMV7M);
++    object_initialize_child(obj, "rcc", &s->rcc, TYPE_STM32H7_RCC);
++
++    for (i = 0; i < STM32H745_NUM_GPIO; i++) {
++        object_initialize_child(obj, "gpio[*]", &s->gpio[i], TYPE_STM32H7_GPIO);
++    }
++
++    object_initialize_child(obj, "usart1", &s->usart1, TYPE_STM32H7_USART);
++
++    s->sysclk = qdev_init_clock_in(DEVICE(s), "sysclk", NULL, NULL, 0);
++    s->refclk = qdev_init_clock_in(DEVICE(s), "refclk", NULL, NULL, 0);
++}
++
++static void stm32h745_soc_realize(DeviceState *dev_soc, Error **errp)
++{
++    STM32H745State *s = STM32H745_SOC(dev_soc);
++    MemoryRegion *system_memory = get_system_memory();
++    DeviceState *armv7m, *dev;
++    SysBusDevice *busdev;
++    Error *err = NULL;
++    int i;
++
++    if (clock_has_source(s->refclk)) {
++        error_setg(errp, "refclk must not be wired by the board");
++        return;
++    }
++    if (!clock_has_source(s->sysclk)) {
++        error_setg(errp, "sysclk must be wired by the board");
++        return;
++    }
++
++    /* SysTick refclk = HCLK / 8 (fixed for now). */
++    clock_set_mul_div(s->refclk, 8, 1);
++    clock_set_source(s->refclk, s->sysclk);
++
++    memory_region_init_rom(&s->flash, OBJECT(dev_soc), "stm32h745.flash",
++                           STM32H745_FLASH_SIZE, &err);
++    if (err) {
++        error_propagate(errp, err);
++        return;
++    }
++    memory_region_init_alias(&s->flash_alias, OBJECT(dev_soc),
++                             "stm32h745.flash.alias", &s->flash, 0,
++                             STM32H745_FLASH_SIZE);
++    memory_region_add_subregion(system_memory, STM32H745_FLASH_BASE, &s->flash);
++    /* Boot remap: flash visible at 0 for initial SP/PC fetch. */
++    memory_region_add_subregion(system_memory, 0, &s->flash_alias);
++
++    memory_region_init_ram(&s->dtcm, NULL, "stm32h745.dtcm",
++                           STM32H745_DTCM_SIZE, &err);
++    if (err) {
++        error_propagate(errp, err);
++        return;
++    }
++    memory_region_add_subregion(system_memory, STM32H745_DTCM_BASE, &s->dtcm);
++
++    memory_region_init_ram(&s->axi_sram, NULL, "stm32h745.axi-sram",
++                           STM32H745_AXI_SRAM_SIZE, &err);
++    if (err) {
++        error_propagate(errp, err);
++        return;
++    }
++    memory_region_add_subregion(system_memory, STM32H745_AXI_SRAM_BASE,
++                                &s->axi_sram);
++
++    memory_region_init_ram(&s->sram1, NULL, "stm32h745.sram1",
++                           STM32H745_SRAM1_SIZE, &err);
++    if (err) {
++        error_propagate(errp, err);
++        return;
++    }
++    memory_region_add_subregion(system_memory, STM32H745_SRAM1_BASE, &s->sram1);
++
++    memory_region_init_ram(&s->sram2, NULL, "stm32h745.sram2",
++                           STM32H745_SRAM2_SIZE, &err);
++    if (err) {
++        error_propagate(errp, err);
++        return;
++    }
++    memory_region_add_subregion(system_memory, STM32H745_SRAM2_BASE, &s->sram2);
++
++    memory_region_init_ram(&s->sram3, NULL, "stm32h745.sram3",
++                           STM32H745_SRAM3_SIZE, &err);
++    if (err) {
++        error_propagate(errp, err);
++        return;
++    }
++    memory_region_add_subregion(system_memory, STM32H745_SRAM3_BASE, &s->sram3);
++
++    memory_region_init_ram(&s->sram4, NULL, "stm32h745.sram4",
++                           STM32H745_SRAM4_SIZE, &err);
++    if (err) {
++        error_propagate(errp, err);
++        return;
++    }
++    memory_region_add_subregion(system_memory, STM32H745_SRAM4_BASE, &s->sram4);
++
++    if (s->sdram_size) {
++        memory_region_init_ram(&s->sdram, NULL, "stm32h745.sdram",
++                               s->sdram_size, &err);
++        if (err) {
++            error_propagate(errp, err);
++            return;
++        }
++        memory_region_add_subregion(system_memory, STM32H745_SDRAM_BASE,
++                                    &s->sdram);
++    }
++
++    armv7m = DEVICE(&s->armv7m);
++    qdev_prop_set_uint32(armv7m, "num-irq", STM32H745_NUM_IRQ);
++    qdev_prop_set_uint8(armv7m, "num-prio-bits", 4);
++    qdev_prop_set_string(armv7m, "cpu-type", ARM_CPU_TYPE_NAME("cortex-m7"));
++    qdev_prop_set_bit(armv7m, "enable-bitband", true);
++    qdev_connect_clock_in(armv7m, "cpuclk", s->sysclk);
++    qdev_connect_clock_in(armv7m, "refclk", s->refclk);
++    object_property_set_link(OBJECT(&s->armv7m), "memory",
++                             OBJECT(system_memory), &error_abort);
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->armv7m), errp)) {
++        return;
++    }
++
++    /* RCC */
++    qdev_prop_set_uint32(DEVICE(&s->rcc), "hse-frequency", s->hse_frequency);
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->rcc), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->rcc), 0, STM32H745_RCC_BASE);
++
++    /* GPIO ports */
++    for (i = 0; i < STM32H745_NUM_GPIO; i++) {
++        dev = DEVICE(&s->gpio[i]);
++        qdev_prop_set_uint32(dev, "moder-reset", gpio_moder_reset[i]);
++        qdev_prop_set_string(dev, "name", gpio_name[i]);
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpio[i]), errp)) {
++            return;
++        }
++        sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpio[i]), 0, gpio_addr[i]);
++    }
++
++    /* USART1 console */
++    dev = DEVICE(&s->usart1);
++    qdev_prop_set_chr(dev, "chardev", serial_hd(0));
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->usart1), errp)) {
++        return;
++    }
++    busdev = SYS_BUS_DEVICE(dev);
++    sysbus_mmio_map(busdev, 0, STM32H745_USART1_BASE);
++    sysbus_connect_irq(busdev, 0,
++                       qdev_get_gpio_in(armv7m, STM32H745_USART1_IRQ));
++
++    /*
++     * Unimplemented stubs so firmware walks do not hit unassigned memory
++     * aborts. Expand to real models in later phases.
++     */
++    create_unimplemented_device("pwr",        0x58024800, 0x400);
++    create_unimplemented_device("exti",       0x58000000, 0x400);
++    create_unimplemented_device("syscfg",     0x58000400, 0x400);
++    create_unimplemented_device("flash-if",   0x52002000, 0x1000);
++    create_unimplemented_device("fmc",        0x52004000, 0x1000);
++    create_unimplemented_device("ltdc",       0x50001000, 0x1000);
++    create_unimplemented_device("i2c3",       0x40005C00, 0x400);
++    create_unimplemented_device("tim2",       0x40000000, 0x400);
++    create_unimplemented_device("tim3",       0x40000400, 0x400);
++    create_unimplemented_device("adc1",       0x40022000, 0x400);
++    create_unimplemented_device("dma1",       0x40020000, 0x400);
++    create_unimplemented_device("dma2",       0x40020400, 0x400);
++}
++
++static const Property stm32h745_soc_properties[] = {
++    DEFINE_PROP_UINT32("hse-frequency", STM32H745State, hse_frequency, 0),
++    DEFINE_PROP_UINT64("sdram-size", STM32H745State, sdram_size,
++                       STM32H745_SDRAM_SIZE),
++};
++
++static void stm32h745_soc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = stm32h745_soc_realize;
++    device_class_set_props(dc, stm32h745_soc_properties);
++}
++
++static const TypeInfo stm32h745_soc_info = {
++    .name = TYPE_STM32H745_SOC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(STM32H745State),
++    .instance_init = stm32h745_soc_initfn,
++    .class_init = stm32h745_soc_class_init,
++};
++
++static void stm32h745_soc_types(void)
++{
++    type_register_static(&stm32h745_soc_info);
++}
++
++type_init(stm32h745_soc_types)
+diff --git a/hw/char/Kconfig b/hw/char/Kconfig
+index 020c0a8..59a5f42 100644
+--- a/hw/char/Kconfig
++++ b/hw/char/Kconfig
+@@ -57,6 +57,9 @@ config STM32F2XX_USART
+ config STM32L4X5_USART
+     bool
+ 
++config STM32H7_USART
++    bool
++
+ config CMSDK_APB_UART
+     bool
+ 
+diff --git a/hw/char/meson.build b/hw/char/meson.build
+index a9e1dc2..0db9d34 100644
+--- a/hw/char/meson.build
++++ b/hw/char/meson.build
+@@ -34,6 +34,7 @@ system_ss.add(when: 'CONFIG_SIFIVE_UART', if_true: files('sifive_uart.c'))
+ system_ss.add(when: 'CONFIG_SH_SCI', if_true: files('sh_serial.c'))
+ system_ss.add(when: 'CONFIG_STM32F2XX_USART', if_true: files('stm32f2xx_usart.c'))
+ system_ss.add(when: 'CONFIG_STM32L4X5_USART', if_true: files('stm32l4x5_usart.c'))
++system_ss.add(when: 'CONFIG_STM32H7_USART', if_true: files('stm32h7_usart.c'))
+ system_ss.add(when: 'CONFIG_MCHP_PFSOC_MMUART', if_true: files('mchp_pfsoc_mmuart.c'))
+ system_ss.add(when: 'CONFIG_HTIF', if_true: files('riscv_htif.c'))
+ system_ss.add(when: 'CONFIG_GOLDFISH_TTY', if_true: files('goldfish_tty.c'))
+diff --git a/hw/char/stm32h7_usart.c b/hw/char/stm32h7_usart.c
+new file mode 100644
+index 0000000..05159e3
+--- /dev/null
++++ b/hw/char/stm32h7_usart.c
+@@ -0,0 +1,277 @@
++/*
++ * STM32H7 USART — polling TX/RX for console bring-up.
++ *
++ * Register map matches the “new” ST USART (H7/L4): CR1@0, ISR@0x1C, TDR@0x28.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "hw/char/stm32h7_usart.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/qdev-properties-system.h"
++#include "migration/vmstate.h"
++
++static void stm32h7_usart_update_irq(STM32H7UsartState *s)
++{
++    bool raise = false;
++
++    if ((s->isr & STM32H7_USART_ISR_TXE) && (s->cr1 & STM32H7_USART_CR1_TXEIE)) {
++        raise = true;
++    }
++    if ((s->isr & STM32H7_USART_ISR_TC) && (s->cr1 & STM32H7_USART_CR1_TCIE)) {
++        raise = true;
++    }
++    if ((s->isr & STM32H7_USART_ISR_RXNE) && (s->cr1 & STM32H7_USART_CR1_RXNEIE)) {
++        raise = true;
++    }
++
++    qemu_set_irq(s->irq, raise);
++}
++
++static void stm32h7_usart_update_ack(STM32H7UsartState *s)
++{
++    if (s->cr1 & STM32H7_USART_CR1_TE) {
++        s->isr |= STM32H7_USART_ISR_TEACK | STM32H7_USART_ISR_TXE |
++                  STM32H7_USART_ISR_TC;
++    } else {
++        s->isr &= ~STM32H7_USART_ISR_TEACK;
++    }
++    if (s->cr1 & STM32H7_USART_CR1_RE) {
++        s->isr |= STM32H7_USART_ISR_REACK;
++    } else {
++        s->isr &= ~STM32H7_USART_ISR_REACK;
++    }
++}
++
++static int stm32h7_usart_can_receive(void *opaque)
++{
++    STM32H7UsartState *s = opaque;
++
++    return !(s->isr & STM32H7_USART_ISR_RXNE);
++}
++
++static void stm32h7_usart_receive(void *opaque, const uint8_t *buf, int size)
++{
++    STM32H7UsartState *s = opaque;
++
++    if (!(s->cr1 & STM32H7_USART_CR1_UE) || !(s->cr1 & STM32H7_USART_CR1_RE)) {
++        return;
++    }
++
++    s->rdr = *buf;
++    s->isr |= STM32H7_USART_ISR_RXNE;
++    stm32h7_usart_update_irq(s);
++}
++
++static void stm32h7_usart_reset(DeviceState *dev)
++{
++    STM32H7UsartState *s = STM32H7_USART(dev);
++
++    s->cr1 = 0;
++    s->cr2 = 0;
++    s->cr3 = 0;
++    s->brr = 0;
++    s->gtpr = 0;
++    s->rtor = 0;
++    s->isr = STM32H7_USART_ISR_TXE | STM32H7_USART_ISR_TC;
++    s->rdr = 0;
++    s->tdr = 0;
++    s->presc = 0;
++    stm32h7_usart_update_irq(s);
++}
++
++static uint64_t stm32h7_usart_read(void *opaque, hwaddr addr, unsigned size)
++{
++    STM32H7UsartState *s = opaque;
++    uint64_t value = 0;
++
++    switch (addr) {
++    case STM32H7_USART_CR1:
++        value = s->cr1;
++        break;
++    case STM32H7_USART_CR2:
++        value = s->cr2;
++        break;
++    case STM32H7_USART_CR3:
++        value = s->cr3;
++        break;
++    case STM32H7_USART_BRR:
++        value = s->brr;
++        break;
++    case STM32H7_USART_GTPR:
++        value = s->gtpr;
++        break;
++    case STM32H7_USART_RTOR:
++        value = s->rtor;
++        break;
++    case STM32H7_USART_ISR:
++        value = s->isr;
++        qemu_chr_fe_accept_input(&s->chr);
++        break;
++    case STM32H7_USART_RDR:
++        value = s->rdr & 0x1FF;
++        s->isr &= ~STM32H7_USART_ISR_RXNE;
++        qemu_chr_fe_accept_input(&s->chr);
++        stm32h7_usart_update_irq(s);
++        break;
++    case STM32H7_USART_TDR:
++        value = s->tdr;
++        break;
++    case STM32H7_USART_PRESC:
++        value = s->presc;
++        break;
++    case STM32H7_USART_RQR:
++    case STM32H7_USART_ICR:
++        value = 0;
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: bad read offset 0x%" HWADDR_PRIx "\n",
++                      __func__, addr);
++        break;
++    }
++
++    return value;
++}
++
++static void stm32h7_usart_write(void *opaque, hwaddr addr,
++                                uint64_t val64, unsigned size)
++{
++    STM32H7UsartState *s = opaque;
++    uint32_t value = val64;
++    uint8_t ch;
++
++    switch (addr) {
++    case STM32H7_USART_CR1:
++        s->cr1 = value;
++        stm32h7_usart_update_ack(s);
++        stm32h7_usart_update_irq(s);
++        break;
++    case STM32H7_USART_CR2:
++        s->cr2 = value;
++        break;
++    case STM32H7_USART_CR3:
++        s->cr3 = value;
++        break;
++    case STM32H7_USART_BRR:
++        s->brr = value & 0xFFFF;
++        break;
++    case STM32H7_USART_GTPR:
++        s->gtpr = value;
++        break;
++    case STM32H7_USART_RTOR:
++        s->rtor = value;
++        break;
++    case STM32H7_USART_RQR:
++        if (value & (1u << 3)) { /* RXFRQ */
++            s->isr &= ~STM32H7_USART_ISR_RXNE;
++        }
++        stm32h7_usart_update_irq(s);
++        break;
++    case STM32H7_USART_ICR:
++        /* Clear corresponding ISR flags (bit layout matches ICR). */
++        s->isr &= ~value;
++        /* TXE is read-only high when TE is set. */
++        stm32h7_usart_update_ack(s);
++        stm32h7_usart_update_irq(s);
++        break;
++    case STM32H7_USART_TDR:
++        s->tdr = value & 0x1FF;
++        if ((s->cr1 & STM32H7_USART_CR1_UE) && (s->cr1 & STM32H7_USART_CR1_TE)) {
++            ch = value;
++            qemu_chr_fe_write_all(&s->chr, &ch, 1);
++            s->isr |= STM32H7_USART_ISR_TXE | STM32H7_USART_ISR_TC;
++            stm32h7_usart_update_irq(s);
++        }
++        break;
++    case STM32H7_USART_PRESC:
++        s->presc = value & 0xF;
++        break;
++    case STM32H7_USART_ISR:
++    case STM32H7_USART_RDR:
++        /* Read-only / clear via ICR. */
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: bad write offset 0x%" HWADDR_PRIx "\n",
++                      __func__, addr);
++        break;
++    }
++}
++
++static const MemoryRegionOps stm32h7_usart_ops = {
++    .read = stm32h7_usart_read,
++    .write = stm32h7_usart_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++};
++
++static const VMStateDescription vmstate_stm32h7_usart = {
++    .name = TYPE_STM32H7_USART,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(cr1, STM32H7UsartState),
++        VMSTATE_UINT32(cr2, STM32H7UsartState),
++        VMSTATE_UINT32(cr3, STM32H7UsartState),
++        VMSTATE_UINT32(brr, STM32H7UsartState),
++        VMSTATE_UINT32(gtpr, STM32H7UsartState),
++        VMSTATE_UINT32(rtor, STM32H7UsartState),
++        VMSTATE_UINT32(isr, STM32H7UsartState),
++        VMSTATE_UINT32(rdr, STM32H7UsartState),
++        VMSTATE_UINT32(tdr, STM32H7UsartState),
++        VMSTATE_UINT32(presc, STM32H7UsartState),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static const Property stm32h7_usart_properties[] = {
++    DEFINE_PROP_CHR("chardev", STM32H7UsartState, chr),
++};
++
++static void stm32h7_usart_init(Object *obj)
++{
++    STM32H7UsartState *s = STM32H7_USART(obj);
++
++    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++    memory_region_init_io(&s->mmio, obj, &stm32h7_usart_ops, s,
++                          TYPE_STM32H7_USART, 0x400);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
++}
++
++static void stm32h7_usart_realize(DeviceState *dev, Error **errp)
++{
++    STM32H7UsartState *s = STM32H7_USART(dev);
++
++    qemu_chr_fe_set_handlers(&s->chr, stm32h7_usart_can_receive,
++                             stm32h7_usart_receive, NULL, NULL,
++                             s, NULL, true);
++}
++
++static void stm32h7_usart_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, stm32h7_usart_reset);
++    device_class_set_props(dc, stm32h7_usart_properties);
++    dc->realize = stm32h7_usart_realize;
++    dc->vmsd = &vmstate_stm32h7_usart;
++}
++
++static const TypeInfo stm32h7_usart_info = {
++    .name = TYPE_STM32H7_USART,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(STM32H7UsartState),
++    .instance_init = stm32h7_usart_init,
++    .class_init = stm32h7_usart_class_init,
++};
++
++static void stm32h7_usart_register_types(void)
++{
++    type_register_static(&stm32h7_usart_info);
++}
++
++type_init(stm32h7_usart_register_types)
+diff --git a/hw/gpio/Kconfig b/hw/gpio/Kconfig
+index a209294..c4d92e0 100644
+--- a/hw/gpio/Kconfig
++++ b/hw/gpio/Kconfig
+@@ -16,6 +16,9 @@ config SIFIVE_GPIO
+ config STM32L4X5_GPIO
+     bool
+ 
++config STM32H7_GPIO
++    bool
++
+ config PCA9552
+     bool
+     depends on I2C
+diff --git a/hw/gpio/meson.build b/hw/gpio/meson.build
+index 7484061..658f7a2 100644
+--- a/hw/gpio/meson.build
++++ b/hw/gpio/meson.build
+@@ -15,6 +15,7 @@ system_ss.add(when: 'CONFIG_RASPI', if_true: files(
+     'bcm2838_gpio.c'
+ ))
+ system_ss.add(when: 'CONFIG_STM32L4X5_SOC', if_true: files('stm32l4x5_gpio.c'))
++system_ss.add(when: 'CONFIG_STM32H7_GPIO', if_true: files('stm32h7_gpio.c'))
+ system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files('aspeed_gpio.c'))
+ system_ss.add(when: 'CONFIG_SIFIVE_GPIO', if_true: files('sifive_gpio.c'))
+ system_ss.add(when: 'CONFIG_PCF8574', if_true: files('pcf8574.c'))
+diff --git a/hw/gpio/stm32h7_gpio.c b/hw/gpio/stm32h7_gpio.c
+new file mode 100644
+index 0000000..1562b7c
+--- /dev/null
++++ b/hw/gpio/stm32h7_gpio.c
+@@ -0,0 +1,190 @@
++/*
++ * STM32H7 GPIO — enough for AF pin mux and simple output.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "hw/gpio/stm32h7_gpio.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "migration/vmstate.h"
++
++static void stm32h7_gpio_update_outputs(STM32H7GpioState *s)
++{
++    int i;
++
++    for (i = 0; i < 16; i++) {
++        /* Mode 01 = general purpose output. */
++        if (extract32(s->moder, i * 2, 2) == 1) {
++            qemu_set_irq(s->output[i], extract32(s->odr, i, 1));
++        }
++    }
++}
++
++static void stm32h7_gpio_reset(DeviceState *dev)
++{
++    STM32H7GpioState *s = STM32H7_GPIO(dev);
++
++    s->moder = s->moder_reset;
++    s->otyper = 0;
++    s->ospeedr = 0;
++    s->pupdr = 0;
++    s->idr = 0;
++    s->odr = 0;
++    s->lckr = 0;
++    s->afrl = 0;
++    s->afrh = 0;
++}
++
++static uint64_t stm32h7_gpio_read(void *opaque, hwaddr addr, unsigned size)
++{
++    STM32H7GpioState *s = opaque;
++
++    switch (addr) {
++    case STM32H7_GPIO_MODER:
++        return s->moder;
++    case STM32H7_GPIO_OTYPER:
++        return s->otyper;
++    case STM32H7_GPIO_OSPEEDR:
++        return s->ospeedr;
++    case STM32H7_GPIO_PUPDR:
++        return s->pupdr;
++    case STM32H7_GPIO_IDR:
++        return s->idr | s->odr;
++    case STM32H7_GPIO_ODR:
++        return s->odr;
++    case STM32H7_GPIO_LCKR:
++        return s->lckr;
++    case STM32H7_GPIO_AFRL:
++        return s->afrl;
++    case STM32H7_GPIO_AFRH:
++        return s->afrh;
++    case STM32H7_GPIO_BSRR:
++        return 0;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: bad read offset 0x%" HWADDR_PRIx "\n",
++                      __func__, addr);
++        return 0;
++    }
++}
++
++static void stm32h7_gpio_write(void *opaque, hwaddr addr,
++                               uint64_t val64, unsigned size)
++{
++    STM32H7GpioState *s = opaque;
++    uint32_t value = val64;
++    uint32_t set, reset;
++
++    switch (addr) {
++    case STM32H7_GPIO_MODER:
++        s->moder = value;
++        stm32h7_gpio_update_outputs(s);
++        break;
++    case STM32H7_GPIO_OTYPER:
++        s->otyper = value & 0xFFFF;
++        break;
++    case STM32H7_GPIO_OSPEEDR:
++        s->ospeedr = value;
++        break;
++    case STM32H7_GPIO_PUPDR:
++        s->pupdr = value;
++        break;
++    case STM32H7_GPIO_ODR:
++        s->odr = value & 0xFFFF;
++        stm32h7_gpio_update_outputs(s);
++        break;
++    case STM32H7_GPIO_BSRR:
++        set = value & 0xFFFF;
++        reset = (value >> 16) & 0xFFFF;
++        s->odr = (s->odr | set) & ~reset;
++        stm32h7_gpio_update_outputs(s);
++        break;
++    case STM32H7_GPIO_LCKR:
++        s->lckr = value;
++        break;
++    case STM32H7_GPIO_AFRL:
++        s->afrl = value;
++        break;
++    case STM32H7_GPIO_AFRH:
++        s->afrh = value;
++        break;
++    case STM32H7_GPIO_IDR:
++        /* Read-only. */
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: bad write offset 0x%" HWADDR_PRIx "\n",
++                      __func__, addr);
++        break;
++    }
++}
++
++static const MemoryRegionOps stm32h7_gpio_ops = {
++    .read = stm32h7_gpio_read,
++    .write = stm32h7_gpio_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static const VMStateDescription vmstate_stm32h7_gpio = {
++    .name = TYPE_STM32H7_GPIO,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(moder, STM32H7GpioState),
++        VMSTATE_UINT32(otyper, STM32H7GpioState),
++        VMSTATE_UINT32(ospeedr, STM32H7GpioState),
++        VMSTATE_UINT32(pupdr, STM32H7GpioState),
++        VMSTATE_UINT32(idr, STM32H7GpioState),
++        VMSTATE_UINT32(odr, STM32H7GpioState),
++        VMSTATE_UINT32(lckr, STM32H7GpioState),
++        VMSTATE_UINT32(afrl, STM32H7GpioState),
++        VMSTATE_UINT32(afrh, STM32H7GpioState),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static const Property stm32h7_gpio_properties[] = {
++    DEFINE_PROP_UINT32("moder-reset", STM32H7GpioState, moder_reset, 0xFFFFFFFF),
++    DEFINE_PROP_STRING("name", STM32H7GpioState, name),
++};
++
++static void stm32h7_gpio_init(Object *obj)
++{
++    STM32H7GpioState *s = STM32H7_GPIO(obj);
++    DeviceState *dev = DEVICE(obj);
++
++    memory_region_init_io(&s->mmio, obj, &stm32h7_gpio_ops, s,
++                          TYPE_STM32H7_GPIO, 0x400);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
++    qdev_init_gpio_out(dev, s->output, 16);
++}
++
++static void stm32h7_gpio_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, stm32h7_gpio_reset);
++    device_class_set_props(dc, stm32h7_gpio_properties);
++    dc->vmsd = &vmstate_stm32h7_gpio;
++}
++
++static const TypeInfo stm32h7_gpio_info = {
++    .name = TYPE_STM32H7_GPIO,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(STM32H7GpioState),
++    .instance_init = stm32h7_gpio_init,
++    .class_init = stm32h7_gpio_class_init,
++};
++
++static void stm32h7_gpio_register_types(void)
++{
++    type_register_static(&stm32h7_gpio_info);
++}
++
++type_init(stm32h7_gpio_register_types)
+diff --git a/hw/misc/Kconfig b/hw/misc/Kconfig
+index 4e35657..52dbc2d 100644
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -99,6 +99,9 @@ config FSL_IMX8MP_CCM
+ config STM32_RCC
+     bool
+ 
++config STM32H7_RCC
++    bool
++
+ config STM32F2XX_SYSCFG
+     bool
+ 
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index b1d8d8e..2cba439 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -109,6 +109,7 @@ system_ss.add(when: 'CONFIG_XLNX_VERSAL_TRNG', if_true: files(
+   'xlnx-versal-trng.c',
+ ))
+ system_ss.add(when: 'CONFIG_STM32_RCC', if_true: files('stm32_rcc.c'))
++system_ss.add(when: 'CONFIG_STM32H7_RCC', if_true: files('stm32h7_rcc.c'))
+ system_ss.add(when: 'CONFIG_STM32F2XX_SYSCFG', if_true: files('stm32f2xx_syscfg.c'))
+ system_ss.add(when: 'CONFIG_STM32F4XX_SYSCFG', if_true: files('stm32f4xx_syscfg.c'))
+ system_ss.add(when: 'CONFIG_STM32F4XX_EXTI', if_true: files('stm32f4xx_exti.c'))
+diff --git a/hw/misc/stm32h7_rcc.c b/hw/misc/stm32h7_rcc.c
+new file mode 100644
+index 0000000..8e7bc65
+--- /dev/null
++++ b/hw/misc/stm32h7_rcc.c
+@@ -0,0 +1,142 @@
++/*
++ * STM32H7 RCC — functional subset for firmware bring-up.
++ *
++ * Models CR ready bits, D1/D2 CFGR, and peripheral enable registers
++ * (AHB4/APB2/APB3/…) as read/write storage with HSE/HSI/PLL ready semantics.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "hw/misc/stm32h7_rcc.h"
++#include "hw/qdev-properties.h"
++#include "migration/vmstate.h"
++
++static void stm32h7_rcc_reset(DeviceState *dev)
++{
++    STM32H7RccState *s = STM32H7_RCC(dev);
++    int i;
++
++    for (i = 0; i < STM32H7_RCC_NREGS; i++) {
++        s->regs[i] = 0;
++    }
++
++    /* HSI on and ready after reset (64 MHz class on H7). */
++    s->regs[STM32H7_RCC_CR / 4] = STM32H7_RCC_CR_HSION | STM32H7_RCC_CR_HSIRDY;
++}
++
++static uint64_t stm32h7_rcc_read(void *opaque, hwaddr addr, unsigned size)
++{
++    STM32H7RccState *s = opaque;
++    uint32_t index = addr / 4;
++
++    if (addr >= 0x200 || (addr & 3)) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: bad read offset 0x%" HWADDR_PRIx "\n",
++                      __func__, addr);
++        return 0;
++    }
++
++    return s->regs[index];
++}
++
++static void stm32h7_rcc_write(void *opaque, hwaddr addr,
++                              uint64_t val64, unsigned size)
++{
++    STM32H7RccState *s = opaque;
++    uint32_t value = val64;
++    uint32_t index = addr / 4;
++    uint32_t cr;
++
++    if (addr >= 0x200 || (addr & 3)) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: bad write offset 0x%" HWADDR_PRIx "\n",
++                      __func__, addr);
++        return;
++    }
++
++    switch (addr) {
++    case STM32H7_RCC_CR:
++        cr = value;
++        /* HSI always ready when requested on. */
++        if (cr & STM32H7_RCC_CR_HSION) {
++            cr |= STM32H7_RCC_CR_HSIRDY;
++        } else {
++            cr &= ~STM32H7_RCC_CR_HSIRDY;
++        }
++        /* HSE ready only if board has a crystal and software enables it. */
++        if ((cr & STM32H7_RCC_CR_HSEON) && s->hse_frequency) {
++            cr |= STM32H7_RCC_CR_HSERDY;
++        } else {
++            cr &= ~STM32H7_RCC_CR_HSERDY;
++        }
++        /* Instant PLL lock when enabled (simplified). */
++        if (cr & STM32H7_RCC_CR_PLL1ON) {
++            cr |= STM32H7_RCC_CR_PLL1RDY;
++        } else {
++            cr &= ~STM32H7_RCC_CR_PLL1RDY;
++        }
++        s->regs[index] = cr;
++        break;
++    default:
++        s->regs[index] = value;
++        break;
++    }
++}
++
++static const MemoryRegionOps stm32h7_rcc_ops = {
++    .read = stm32h7_rcc_read,
++    .write = stm32h7_rcc_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static const VMStateDescription vmstate_stm32h7_rcc = {
++    .name = TYPE_STM32H7_RCC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, STM32H7RccState, STM32H7_RCC_NREGS),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static const Property stm32h7_rcc_properties[] = {
++    DEFINE_PROP_UINT32("hse-frequency", STM32H7RccState, hse_frequency, 0),
++};
++
++static void stm32h7_rcc_init(Object *obj)
++{
++    STM32H7RccState *s = STM32H7_RCC(obj);
++
++    memory_region_init_io(&s->mmio, obj, &stm32h7_rcc_ops, s,
++                          TYPE_STM32H7_RCC, 0x400);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
++}
++
++static void stm32h7_rcc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, stm32h7_rcc_reset);
++    device_class_set_props(dc, stm32h7_rcc_properties);
++    dc->vmsd = &vmstate_stm32h7_rcc;
++}
++
++static const TypeInfo stm32h7_rcc_info = {
++    .name = TYPE_STM32H7_RCC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(STM32H7RccState),
++    .instance_init = stm32h7_rcc_init,
++    .class_init = stm32h7_rcc_class_init,
++};
++
++static void stm32h7_rcc_register_types(void)
++{
++    type_register_static(&stm32h7_rcc_info);
++}
++
++type_init(stm32h7_rcc_register_types)
+diff --git a/include/hw/arm/stm32h745_soc.h b/include/hw/arm/stm32h745_soc.h
+new file mode 100644
+index 0000000..3d07dad
+--- /dev/null
++++ b/include/hw/arm/stm32h745_soc.h
+@@ -0,0 +1,72 @@
++/*
++ * STM32H745 SoC (Cortex-M7 bring-up subset)
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_ARM_STM32H745_SOC_H
++#define HW_ARM_STM32H745_SOC_H
++
++#include "hw/arm/armv7m.h"
++#include "hw/char/stm32h7_usart.h"
++#include "hw/gpio/stm32h7_gpio.h"
++#include "hw/misc/stm32h7_rcc.h"
++#include "hw/clock.h"
++#include "qom/object.h"
++
++#define TYPE_STM32H745_SOC "stm32h745-soc"
++OBJECT_DECLARE_SIMPLE_TYPE(STM32H745State, STM32H745_SOC)
++
++#define STM32H745_NUM_GPIO  11  /* A..K */
++#define STM32H745_NUM_USART 1   /* USART1 for console; expand later */
++
++#define STM32H745_FLASH_BASE     0x08000000
++#define STM32H745_FLASH_SIZE     (2 * 1024 * 1024)
++#define STM32H745_DTCM_BASE      0x20000000
++#define STM32H745_DTCM_SIZE      (128 * 1024)
++#define STM32H745_AXI_SRAM_BASE  0x24000000
++#define STM32H745_AXI_SRAM_SIZE  (512 * 1024)
++#define STM32H745_SRAM1_BASE     0x30000000
++#define STM32H745_SRAM1_SIZE     (128 * 1024)
++#define STM32H745_SRAM2_BASE     0x30020000
++#define STM32H745_SRAM2_SIZE     (128 * 1024)
++#define STM32H745_SRAM3_BASE     0x30040000
++#define STM32H745_SRAM3_SIZE     (32 * 1024)
++#define STM32H745_SRAM4_BASE     0x38000000
++#define STM32H745_SRAM4_SIZE     (64 * 1024)
++#define STM32H745_SDRAM_BASE     0xC0000000
++#define STM32H745_SDRAM_SIZE     (64 * 1024 * 1024)
++
++#define STM32H745_RCC_BASE       0x58024400
++#define STM32H745_GPIOA_BASE     0x58020000
++#define STM32H745_USART1_BASE    0x40011000
++#define STM32H745_USART1_IRQ     37
++#define STM32H745_NUM_IRQ        150
++
++struct STM32H745State {
++    SysBusDevice parent_obj;
++
++    ARMv7MState armv7m;
++
++    STM32H7RccState rcc;
++    STM32H7GpioState gpio[STM32H745_NUM_GPIO];
++    STM32H7UsartState usart1;
++
++    MemoryRegion flash;
++    MemoryRegion flash_alias;
++    MemoryRegion dtcm;
++    MemoryRegion axi_sram;
++    MemoryRegion sram1;
++    MemoryRegion sram2;
++    MemoryRegion sram3;
++    MemoryRegion sram4;
++    MemoryRegion sdram;
++
++    Clock *sysclk;
++    Clock *refclk;
++
++    uint32_t hse_frequency;
++    uint64_t sdram_size;
++};
++
++#endif /* HW_ARM_STM32H745_SOC_H */
+diff --git a/include/hw/char/stm32h7_usart.h b/include/hw/char/stm32h7_usart.h
+new file mode 100644
+index 0000000..5e04342
+--- /dev/null
++++ b/include/hw/char/stm32h7_usart.h
+@@ -0,0 +1,63 @@
++/*
++ * STM32H7 USART (CR1/ISR/TDR layout — same family as L4/F0 “new” USART)
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_CHAR_STM32H7_USART_H
++#define HW_CHAR_STM32H7_USART_H
++
++#include "hw/sysbus.h"
++#include "chardev/char-fe.h"
++#include "qom/object.h"
++
++#define TYPE_STM32H7_USART "stm32h7-usart"
++OBJECT_DECLARE_SIMPLE_TYPE(STM32H7UsartState, STM32H7_USART)
++
++#define STM32H7_USART_CR1  0x00
++#define STM32H7_USART_CR2  0x04
++#define STM32H7_USART_CR3  0x08
++#define STM32H7_USART_BRR  0x0C
++#define STM32H7_USART_GTPR 0x10
++#define STM32H7_USART_RTOR 0x14
++#define STM32H7_USART_RQR  0x18
++#define STM32H7_USART_ISR  0x1C
++#define STM32H7_USART_ICR  0x20
++#define STM32H7_USART_RDR  0x24
++#define STM32H7_USART_TDR  0x28
++#define STM32H7_USART_PRESC 0x2C
++
++#define STM32H7_USART_CR1_UE    (1u << 0)
++#define STM32H7_USART_CR1_RE    (1u << 2)
++#define STM32H7_USART_CR1_TE    (1u << 3)
++#define STM32H7_USART_CR1_RXNEIE (1u << 5)
++#define STM32H7_USART_CR1_TCIE  (1u << 6)
++#define STM32H7_USART_CR1_TXEIE (1u << 7)
++
++#define STM32H7_USART_ISR_RXNE  (1u << 5)
++#define STM32H7_USART_ISR_TC    (1u << 6)
++#define STM32H7_USART_ISR_TXE   (1u << 7)
++#define STM32H7_USART_ISR_TEACK (1u << 21)
++#define STM32H7_USART_ISR_REACK (1u << 22)
++
++struct STM32H7UsartState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion mmio;
++
++    uint32_t cr1;
++    uint32_t cr2;
++    uint32_t cr3;
++    uint32_t brr;
++    uint32_t gtpr;
++    uint32_t rtor;
++    uint32_t isr;
++    uint32_t rdr;
++    uint32_t tdr;
++    uint32_t presc;
++
++    CharBackend chr;
++    qemu_irq irq;
++};
++
++#endif /* HW_CHAR_STM32H7_USART_H */
+diff --git a/include/hw/gpio/stm32h7_gpio.h b/include/hw/gpio/stm32h7_gpio.h
+new file mode 100644
+index 0000000..64bedc5
+--- /dev/null
++++ b/include/hw/gpio/stm32h7_gpio.h
+@@ -0,0 +1,49 @@
++/*
++ * STM32H7 GPIO (MODER/AFR and basic ODR/IDR/BSRR)
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_GPIO_STM32H7_GPIO_H
++#define HW_GPIO_STM32H7_GPIO_H
++
++#include "hw/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_STM32H7_GPIO "stm32h7-gpio"
++OBJECT_DECLARE_SIMPLE_TYPE(STM32H7GpioState, STM32H7_GPIO)
++
++#define STM32H7_GPIO_MODER   0x00
++#define STM32H7_GPIO_OTYPER  0x04
++#define STM32H7_GPIO_OSPEEDR 0x08
++#define STM32H7_GPIO_PUPDR   0x0C
++#define STM32H7_GPIO_IDR     0x10
++#define STM32H7_GPIO_ODR     0x14
++#define STM32H7_GPIO_BSRR    0x18
++#define STM32H7_GPIO_LCKR    0x1C
++#define STM32H7_GPIO_AFRL    0x20
++#define STM32H7_GPIO_AFRH    0x24
++
++struct STM32H7GpioState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion mmio;
++
++    uint32_t moder;
++    uint32_t otyper;
++    uint32_t ospeedr;
++    uint32_t pupdr;
++    uint32_t idr;
++    uint32_t odr;
++    uint32_t lckr;
++    uint32_t afrl;
++    uint32_t afrh;
++
++    /* Reset value for MODER (package-specific; default all analog). */
++    uint32_t moder_reset;
++
++    char *name;
++    qemu_irq output[16];
++};
++
++#endif /* HW_GPIO_STM32H7_GPIO_H */
+diff --git a/include/hw/misc/stm32h7_rcc.h b/include/hw/misc/stm32h7_rcc.h
+new file mode 100644
+index 0000000..5392f87
+--- /dev/null
++++ b/include/hw/misc/stm32h7_rcc.h
+@@ -0,0 +1,54 @@
++/*
++ * STM32H7 RCC (minimal: ENR/CFGR/CR enough for bring-up)
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_MISC_STM32H7_RCC_H
++#define HW_MISC_STM32H7_RCC_H
++
++#include "hw/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_STM32H7_RCC "stm32h7-rcc"
++OBJECT_DECLARE_SIMPLE_TYPE(STM32H7RccState, STM32H7_RCC)
++
++/* Register offsets (RM0399 / stm32h7 PAC) */
++#define STM32H7_RCC_CR          0x00
++#define STM32H7_RCC_HSICFGR     0x04
++#define STM32H7_RCC_CRRCR       0x08
++#define STM32H7_RCC_CSICFGR     0x0C
++#define STM32H7_RCC_CFGR        0x10
++#define STM32H7_RCC_D1CFGR      0x18
++#define STM32H7_RCC_D2CFGR      0x1C
++#define STM32H7_RCC_D3CFGR      0x20
++#define STM32H7_RCC_PLLCKSELR   0x28
++#define STM32H7_RCC_PLLCFGR     0x2C
++#define STM32H7_RCC_PLL1DIVR    0x30
++#define STM32H7_RCC_AHB4ENR     0xE0
++#define STM32H7_RCC_APB3ENR     0xE4
++#define STM32H7_RCC_APB1LENR    0xE8
++#define STM32H7_RCC_APB1HENR    0xEC
++#define STM32H7_RCC_APB2ENR     0xF0
++#define STM32H7_RCC_APB4ENR     0xF4
++
++#define STM32H7_RCC_CR_HSION    (1u << 0)
++#define STM32H7_RCC_CR_HSIRDY   (1u << 2)
++#define STM32H7_RCC_CR_HSEON    (1u << 16)
++#define STM32H7_RCC_CR_HSERDY   (1u << 17)
++#define STM32H7_RCC_CR_PLL1ON   (1u << 24)
++#define STM32H7_RCC_CR_PLL1RDY  (1u << 25)
++
++#define STM32H7_RCC_NREGS       (0x200 / 4)
++
++struct STM32H7RccState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion mmio;
++    uint32_t regs[STM32H7_RCC_NREGS];
++
++    /* Board-supplied HSE frequency (Hz); 0 means no crystal. */
++    uint32_t hse_frequency;
++};
++
++#endif /* HW_MISC_STM32H7_RCC_H */
+-- 
+2.54.0
+

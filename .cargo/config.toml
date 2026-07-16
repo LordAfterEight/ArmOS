@@ -2,6 +2,7 @@
 target = "thumbv7em-none-eabihf"
 
 [target.thumbv7em-none-eabihf]
+# Default: custom stm32h745-carrier (ensures/builds QEMU under qemu-stm32h745/).
 runner = "scripts/qemu-run.sh"
 rustflags = [
     "-C", "force-frame-pointers=yes",
@@ -9,5 +10,7 @@ rustflags = [
 ]
 
 [alias]
-hw = "build --release --no-default-features"
-qemu = "run --features qemu"
+# Flash-oriented release (same memory map as default QEMU; no runner).
+hw = "build --release"
+# Legacy mps2-an500 + semihosting (uses system qemu-system-arm).
+mps2 = "run --features mps2"

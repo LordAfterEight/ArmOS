@@ -5,10 +5,13 @@ edition = "2024"
 build = "build.rs"
 
 [features]
-# Enable for `cargo run` (QEMU semihosting I/O). Disable for on-target flashing:
-#   cargo build --release --no-default-features
-default = ["qemu"]
-qemu = []
+# Default: hardware MMIO map (linker.ld @ 0x08000000) for real H745 *and*
+# the in-tree stm32h745-carrier QEMU machine (`cargo run`).
+#
+# Optional legacy mps2-an500 + semihosting (no custom QEMU needed):
+#   cargo run --features mps2
+default = []
+mps2 = []
 probe-panic = ["dep:panic-probe", "dep:cortex-m"]
 
 [lib]

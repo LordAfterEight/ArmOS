@@ -1,0 +1,705 @@
+From f31d486cafe4f8a3bdc1134b9ef48d8ea4194860 Mon Sep 17 00:00:00 2001
+From: LordAfterEight <elias@stettmayer.de>
+Date: Thu, 16 Jul 2026 20:22:23 +0200
+Subject: [PATCH 2/2] hw/display: add STM32H7 LTDC layer-1 scanout
+
+Model enough LTDC registers for ArmOS (timings, layer1 ARGB8888,
+CFBAR/reload, GCR enable) and present the guest framebuffer in a
+QEMU graphic console (~30 Hz). Wire LTDC into stm32h745-soc.
+---
+ hw/arm/Kconfig                    |   1 +
+ hw/arm/stm32h745_soc.c            |  12 +-
+ hw/display/Kconfig                |   3 +
+ hw/display/meson.build            |   1 +
+ hw/display/stm32h7_ltdc.c         | 472 ++++++++++++++++++++++++++++++
+ include/hw/arm/stm32h745_soc.h    |   5 +
+ include/hw/display/stm32h7_ltdc.h |  92 ++++++
+ 7 files changed, 585 insertions(+), 1 deletion(-)
+ create mode 100644 hw/display/stm32h7_ltdc.c
+ create mode 100644 include/hw/display/stm32h7_ltdc.h
+
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 2c71c5b..249ad1d 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -438,6 +438,7 @@ config STM32H745_SOC
+     select STM32H7_RCC
+     select STM32H7_GPIO
+     select STM32H7_USART
++    select STM32H7_LTDC
+ 
+ config XLNX_ZYNQMP_ARM
+     bool
+diff --git a/hw/arm/stm32h745_soc.c b/hw/arm/stm32h745_soc.c
+index 0a10051..bb32f3a 100644
+--- a/hw/arm/stm32h745_soc.c
++++ b/hw/arm/stm32h745_soc.c
+@@ -55,6 +55,7 @@ static void stm32h745_soc_initfn(Object *obj)
+     }
+ 
+     object_initialize_child(obj, "usart1", &s->usart1, TYPE_STM32H7_USART);
++    object_initialize_child(obj, "ltdc", &s->ltdc, TYPE_STM32H7_LTDC);
+ 
+     s->sysclk = qdev_init_clock_in(DEVICE(s), "sysclk", NULL, NULL, 0);
+     s->refclk = qdev_init_clock_in(DEVICE(s), "refclk", NULL, NULL, 0);
+@@ -197,6 +198,16 @@ static void stm32h745_soc_realize(DeviceState *dev_soc, Error **errp)
+     sysbus_connect_irq(busdev, 0,
+                        qdev_get_gpio_in(armv7m, STM32H745_USART1_IRQ));
+ 
++    /* LTDC → host graphic console */
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->ltdc), errp)) {
++        return;
++    }
++    busdev = SYS_BUS_DEVICE(&s->ltdc);
++    sysbus_mmio_map(busdev, 0, STM32H745_LTDC_BASE);
++    sysbus_connect_irq(busdev, 0, qdev_get_gpio_in(armv7m, STM32H745_LTDC_IRQ));
++    sysbus_connect_irq(busdev, 1,
++                       qdev_get_gpio_in(armv7m, STM32H745_LTDC_ER_IRQ));
++
+     /*
+      * Unimplemented stubs so firmware walks do not hit unassigned memory
+      * aborts. Expand to real models in later phases.
+@@ -206,7 +217,6 @@ static void stm32h745_soc_realize(DeviceState *dev_soc, Error **errp)
+     create_unimplemented_device("syscfg",     0x58000400, 0x400);
+     create_unimplemented_device("flash-if",   0x52002000, 0x1000);
+     create_unimplemented_device("fmc",        0x52004000, 0x1000);
+-    create_unimplemented_device("ltdc",       0x50001000, 0x1000);
+     create_unimplemented_device("i2c3",       0x40005C00, 0x400);
+     create_unimplemented_device("tim2",       0x40000000, 0x400);
+     create_unimplemented_device("tim3",       0x40000400, 0x400);
+diff --git a/hw/display/Kconfig b/hw/display/Kconfig
+index 1e95ab2..91b6627 100644
+--- a/hw/display/Kconfig
++++ b/hw/display/Kconfig
+@@ -25,6 +25,9 @@ config PL110
+     bool
+     select FRAMEBUFFER
+ 
++config STM32H7_LTDC
++    bool
++
+ config SII9022
+     bool
+     depends on I2C
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index 90e6c04..a1301bc 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -11,6 +11,7 @@ system_ss.add(when: ['CONFIG_VGA_CIRRUS', 'CONFIG_VGA_ISA'], if_true: files('cir
+ system_ss.add(when: 'CONFIG_G364FB', if_true: files('g364fb.c'))
+ system_ss.add(when: 'CONFIG_JAZZ_LED', if_true: files('jazz_led.c'))
+ system_ss.add(when: 'CONFIG_PL110', if_true: files('pl110.c'))
++system_ss.add(when: 'CONFIG_STM32H7_LTDC', if_true: files('stm32h7_ltdc.c'))
+ system_ss.add(when: 'CONFIG_SII9022', if_true: files('sii9022.c'))
+ system_ss.add(when: 'CONFIG_SSD0303', if_true: files('ssd0303.c'))
+ system_ss.add(when: 'CONFIG_SSD0323', if_true: files('ssd0323.c'))
+diff --git a/hw/display/stm32h7_ltdc.c b/hw/display/stm32h7_ltdc.c
+new file mode 100644
+index 0000000..ffae62a
+--- /dev/null
++++ b/hw/display/stm32h7_ltdc.c
+@@ -0,0 +1,472 @@
++/*
++ * STM32H7 LTDC — application-accurate layer-1 ARGB8888 scanout for ArmOS.
++ *
++ * Copies the guest framebuffer (typically FMC SDRAM @ 0xC0000000) into a
++ * QEMU console surface. Shadow-register reload (SRCR) and GCR/L1CR enable
++ * are enough for the Rust ArmOS LTDC driver.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "hw/display/stm32h7_ltdc.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "migration/vmstate.h"
++#include "exec/cpu-common.h"
++#include "ui/console.h"
++#include "ui/pixel_ops.h"
++
++/* ~30 Hz present rate — fine for UI work, not pixel-clock accurate. */
++#define LTDC_REFRESH_NS  (33 * 1000 * 1000)
++
++static bool stm32h7_ltdc_enabled(STM32H7LtdcState *s)
++{
++    return (s->gcr & LTDC_GCR_LTDCEN) && (s->l1cr & LTDC_L1CR_LEN);
++}
++
++static void stm32h7_ltdc_active_size(STM32H7LtdcState *s,
++                                     int *width, int *height)
++{
++    uint32_t ahbp = extract32(s->bpcr, 16, 12);
++    uint32_t avbp = extract32(s->bpcr, 0, 11);
++    uint32_t aaw = extract32(s->awcr, 16, 12);
++    uint32_t aah = extract32(s->awcr, 0, 11);
++    int w = (int)aaw - (int)ahbp;
++    int h = (int)aah - (int)avbp;
++
++    if (w <= 0 || h <= 0) {
++        /* Fall back to layer line count / pitch when timings not programmed. */
++        int pitch = extract32(s->l1cfblr, 16, 13);
++        int lines = extract32(s->l1cfblnr, 0, 11);
++        if (pitch >= 4 && lines > 0) {
++            w = pitch / 4;
++            h = lines;
++        } else {
++            w = 800;
++            h = 480;
++        }
++    }
++
++    if (w < 16) {
++        w = 16;
++    }
++    if (h < 16) {
++        h = 16;
++    }
++    if (w > 2048) {
++        w = 2048;
++    }
++    if (h > 2048) {
++        h = 2048;
++    }
++
++    *width = w;
++    *height = h;
++}
++
++static int stm32h7_ltdc_pitch(STM32H7LtdcState *s, int width)
++{
++    int pitch = extract32(s->l1cfblr, 16, 13);
++
++    if (pitch < width * 4) {
++        pitch = width * 4;
++    }
++    return pitch;
++}
++
++static void stm32h7_ltdc_update_irq(STM32H7LtdcState *s)
++{
++    qemu_set_irq(s->irq, !!(s->isr & s->ier));
++}
++
++static void stm32h7_ltdc_gfx_update(void *opaque)
++{
++    STM32H7LtdcState *s = opaque;
++    DisplaySurface *surface;
++    int width, height, pitch, y;
++    int dest_stride;
++    uint8_t *dst;
++    hwaddr addr;
++    uint32_t pf;
++
++    if (!stm32h7_ltdc_enabled(s) || s->l1cfbar == 0) {
++        return;
++    }
++
++    stm32h7_ltdc_active_size(s, &width, &height);
++    pitch = stm32h7_ltdc_pitch(s, width);
++    addr = s->l1cfbar;
++    pf = s->l1pfcr & 0x7;
++
++    if (s->invalidate) {
++        qemu_console_resize(s->con, width, height);
++        s->invalidate = 0;
++    }
++
++    surface = qemu_console_surface(s->con);
++    if (!surface || surface_width(surface) != width ||
++        surface_height(surface) != height) {
++        qemu_console_resize(s->con, width, height);
++        surface = qemu_console_surface(s->con);
++    }
++    if (!surface) {
++        return;
++    }
++
++    dst = surface_data(surface);
++    dest_stride = surface_stride(surface);
++
++    /*
++     * ArmOS uses LTDC ARGB8888 with guest words 0x00RRGGBB (LE bytes B,G,R,X).
++     * That matches PIXMAN_x8r8g8b8 on little-endian hosts when we copy raw.
++     * RGB565 is converted; other formats fill black.
++     */
++    for (y = 0; y < height; y++) {
++        uint8_t *line = dst + y * dest_stride;
++
++        if (pf == LTDC_PF_ARGB8888 || pf == LTDC_PF_RGB888) {
++            /* RGB888 still stored as 32-bit words in our guest path; copy 32bpp. */
++            cpu_physical_memory_read(addr + (hwaddr)y * pitch, line, width * 4);
++        } else if (pf == LTDC_PF_RGB565) {
++            uint8_t src[2048 * 2];
++            int x;
++
++            cpu_physical_memory_read(addr + (hwaddr)y * pitch, src, width * 2);
++            for (x = 0; x < width; x++) {
++                uint16_t p = lduw_le_p(src + x * 2);
++                uint8_t r = ((p >> 11) & 0x1f) << 3;
++                uint8_t g = ((p >> 5) & 0x3f) << 2;
++                uint8_t b = (p & 0x1f) << 3;
++                stl_le_p(line + x * 4, rgb_to_pixel32(r, g, b));
++            }
++        } else {
++            memset(line, 0, width * 4);
++        }
++    }
++
++    dpy_gfx_update_full(s->con);
++
++    /* Lifeline interrupt (simplified): pulse LIF if enabled. */
++    if (s->ier & (1u << 0)) {
++        s->isr |= (1u << 0);
++        stm32h7_ltdc_update_irq(s);
++    }
++}
++
++static void stm32h7_ltdc_invalidate(void *opaque)
++{
++    STM32H7LtdcState *s = opaque;
++
++    s->invalidate = 1;
++}
++
++static void stm32h7_ltdc_vblank(void *opaque)
++{
++    STM32H7LtdcState *s = opaque;
++
++    if (stm32h7_ltdc_enabled(s)) {
++        stm32h7_ltdc_gfx_update(s);
++    }
++    timer_mod(s->vblank_timer,
++              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + LTDC_REFRESH_NS);
++}
++
++static void stm32h7_ltdc_reload(STM32H7LtdcState *s)
++{
++    /*
++     * Hardware reloads shadow registers here. We apply writes immediately,
++     * so reload just forces a full redraw with the current CFBAR/geometry.
++     */
++    s->invalidate = 1;
++    if (stm32h7_ltdc_enabled(s)) {
++        stm32h7_ltdc_gfx_update(s);
++        timer_mod(s->vblank_timer,
++                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + LTDC_REFRESH_NS);
++    }
++}
++
++static uint64_t stm32h7_ltdc_read(void *opaque, hwaddr addr, unsigned size)
++{
++    STM32H7LtdcState *s = opaque;
++
++    switch (addr) {
++    case LTDC_SSCR:
++        return s->sscr;
++    case LTDC_BPCR:
++        return s->bpcr;
++    case LTDC_AWCR:
++        return s->awcr;
++    case LTDC_TWCR:
++        return s->twcr;
++    case LTDC_GCR:
++        return s->gcr;
++    case LTDC_SRCR:
++        return 0;
++    case LTDC_BCCR:
++        return s->bccr;
++    case LTDC_IER:
++        return s->ier;
++    case LTDC_ISR:
++        return s->isr;
++    case LTDC_ICR:
++        return 0;
++    case LTDC_LIPCR:
++        return s->lipcr;
++    case LTDC_CPSR:
++        return 0;
++    case LTDC_CDSR:
++        /* VSYNC/HSYNC/etc idle-high-ish status */
++        return 0xF;
++    case LTDC_L1CR:
++        return s->l1cr;
++    case LTDC_L1WHPCR:
++        return s->l1whpcr;
++    case LTDC_L1WVPCR:
++        return s->l1wvpcr;
++    case LTDC_L1CKCR:
++        return s->l1ckcr;
++    case LTDC_L1PFCR:
++        return s->l1pfcr;
++    case LTDC_L1CACR:
++        return s->l1cacr;
++    case LTDC_L1DCCR:
++        return s->l1dccr;
++    case LTDC_L1BFCR:
++        return s->l1bfcr;
++    case LTDC_L1CFBAR:
++        return s->l1cfbar;
++    case LTDC_L1CFBLR:
++        return s->l1cfblr;
++    case LTDC_L1CFBLNR:
++        return s->l1cfblnr;
++    default:
++        qemu_log_mask(LOG_UNIMP,
++                      "stm32h7_ltdc: read offset 0x%" HWADDR_PRIx "\n", addr);
++        return 0;
++    }
++}
++
++static void stm32h7_ltdc_write(void *opaque, hwaddr addr,
++                               uint64_t val64, unsigned size)
++{
++    STM32H7LtdcState *s = opaque;
++    uint32_t value = val64;
++
++    switch (addr) {
++    case LTDC_SSCR:
++        s->sscr = value;
++        break;
++    case LTDC_BPCR:
++        s->bpcr = value;
++        s->invalidate = 1;
++        break;
++    case LTDC_AWCR:
++        s->awcr = value;
++        s->invalidate = 1;
++        break;
++    case LTDC_TWCR:
++        s->twcr = value;
++        break;
++    case LTDC_GCR:
++        s->gcr = value;
++        if (stm32h7_ltdc_enabled(s)) {
++            s->invalidate = 1;
++            timer_mod(s->vblank_timer,
++                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + LTDC_REFRESH_NS);
++        } else {
++            timer_del(s->vblank_timer);
++        }
++        break;
++    case LTDC_SRCR:
++        if (value & (LTDC_SRCR_IMR | LTDC_SRCR_VBR)) {
++            stm32h7_ltdc_reload(s);
++        }
++        break;
++    case LTDC_BCCR:
++        s->bccr = value & 0xFFFFFF;
++        break;
++    case LTDC_IER:
++        s->ier = value & 0x1F;
++        stm32h7_ltdc_update_irq(s);
++        break;
++    case LTDC_ICR:
++        s->isr &= ~value;
++        stm32h7_ltdc_update_irq(s);
++        break;
++    case LTDC_LIPCR:
++        s->lipcr = value & 0x7FF;
++        break;
++    case LTDC_L1CR:
++        s->l1cr = value;
++        if (stm32h7_ltdc_enabled(s)) {
++            s->invalidate = 1;
++            timer_mod(s->vblank_timer,
++                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + LTDC_REFRESH_NS);
++        }
++        break;
++    case LTDC_L1WHPCR:
++        s->l1whpcr = value;
++        break;
++    case LTDC_L1WVPCR:
++        s->l1wvpcr = value;
++        break;
++    case LTDC_L1CKCR:
++        s->l1ckcr = value;
++        break;
++    case LTDC_L1PFCR:
++        s->l1pfcr = value & 0x7;
++        s->invalidate = 1;
++        break;
++    case LTDC_L1CACR:
++        s->l1cacr = value & 0xFF;
++        break;
++    case LTDC_L1DCCR:
++        s->l1dccr = value;
++        break;
++    case LTDC_L1BFCR:
++        s->l1bfcr = value;
++        break;
++    case LTDC_L1CFBAR:
++        s->l1cfbar = value;
++        break;
++    case LTDC_L1CFBLR:
++        s->l1cfblr = value;
++        s->invalidate = 1;
++        break;
++    case LTDC_L1CFBLNR:
++        s->l1cfblnr = value & 0x7FF;
++        s->invalidate = 1;
++        break;
++    case LTDC_L1CLUTWR:
++        /* CLUT not modelled */
++        break;
++    case LTDC_ISR:
++    case LTDC_CPSR:
++    case LTDC_CDSR:
++        /* read-only */
++        break;
++    default:
++        qemu_log_mask(LOG_UNIMP,
++                      "stm32h7_ltdc: write offset 0x%" HWADDR_PRIx
++                      " value 0x%" PRIx32 "\n", addr, value);
++        break;
++    }
++}
++
++static const MemoryRegionOps stm32h7_ltdc_ops = {
++    .read = stm32h7_ltdc_read,
++    .write = stm32h7_ltdc_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static const GraphicHwOps stm32h7_ltdc_gfx_ops = {
++    .invalidate = stm32h7_ltdc_invalidate,
++    .gfx_update = stm32h7_ltdc_gfx_update,
++};
++
++static void stm32h7_ltdc_reset(DeviceState *dev)
++{
++    STM32H7LtdcState *s = STM32H7_LTDC(dev);
++
++    s->sscr = 0;
++    s->bpcr = 0;
++    s->awcr = 0;
++    s->twcr = 0;
++    s->gcr = 0x2220; /* reset value per RM (DEN/PCPOL etc defaults) */
++    s->bccr = 0;
++    s->ier = 0;
++    s->isr = 0;
++    s->lipcr = 0;
++    s->l1cr = 0;
++    s->l1whpcr = 0;
++    s->l1wvpcr = 0;
++    s->l1ckcr = 0;
++    s->l1pfcr = 0;
++    s->l1cacr = 0xFF;
++    s->l1dccr = 0;
++    s->l1bfcr = 0x607;
++    s->l1cfbar = 0;
++    s->l1cfblr = 0;
++    s->l1cfblnr = 0;
++    s->invalidate = 1;
++    timer_del(s->vblank_timer);
++}
++
++static void stm32h7_ltdc_realize(DeviceState *dev, Error **errp)
++{
++    STM32H7LtdcState *s = STM32H7_LTDC(dev);
++
++    s->con = graphic_console_init(dev, 0, &stm32h7_ltdc_gfx_ops, s);
++    qemu_console_resize(s->con, 800, 480);
++}
++
++static void stm32h7_ltdc_init(Object *obj)
++{
++    STM32H7LtdcState *s = STM32H7_LTDC(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &stm32h7_ltdc_ops, s,
++                          TYPE_STM32H7_LTDC, 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    sysbus_init_irq(sbd, &s->irq_err);
++
++    s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stm32h7_ltdc_vblank, s);
++}
++
++static const VMStateDescription vmstate_stm32h7_ltdc = {
++    .name = TYPE_STM32H7_LTDC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(sscr, STM32H7LtdcState),
++        VMSTATE_UINT32(bpcr, STM32H7LtdcState),
++        VMSTATE_UINT32(awcr, STM32H7LtdcState),
++        VMSTATE_UINT32(twcr, STM32H7LtdcState),
++        VMSTATE_UINT32(gcr, STM32H7LtdcState),
++        VMSTATE_UINT32(bccr, STM32H7LtdcState),
++        VMSTATE_UINT32(ier, STM32H7LtdcState),
++        VMSTATE_UINT32(isr, STM32H7LtdcState),
++        VMSTATE_UINT32(lipcr, STM32H7LtdcState),
++        VMSTATE_UINT32(l1cr, STM32H7LtdcState),
++        VMSTATE_UINT32(l1whpcr, STM32H7LtdcState),
++        VMSTATE_UINT32(l1wvpcr, STM32H7LtdcState),
++        VMSTATE_UINT32(l1pfcr, STM32H7LtdcState),
++        VMSTATE_UINT32(l1cacr, STM32H7LtdcState),
++        VMSTATE_UINT32(l1bfcr, STM32H7LtdcState),
++        VMSTATE_UINT32(l1cfbar, STM32H7LtdcState),
++        VMSTATE_UINT32(l1cfblr, STM32H7LtdcState),
++        VMSTATE_UINT32(l1cfblnr, STM32H7LtdcState),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static void stm32h7_ltdc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = stm32h7_ltdc_realize;
++    device_class_set_legacy_reset(dc, stm32h7_ltdc_reset);
++    dc->vmsd = &vmstate_stm32h7_ltdc;
++}
++
++static const TypeInfo stm32h7_ltdc_info = {
++    .name = TYPE_STM32H7_LTDC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(STM32H7LtdcState),
++    .instance_init = stm32h7_ltdc_init,
++    .class_init = stm32h7_ltdc_class_init,
++};
++
++static void stm32h7_ltdc_register_types(void)
++{
++    type_register_static(&stm32h7_ltdc_info);
++}
++
++type_init(stm32h7_ltdc_register_types)
+diff --git a/include/hw/arm/stm32h745_soc.h b/include/hw/arm/stm32h745_soc.h
+index 3d07dad..f660928 100644
+--- a/include/hw/arm/stm32h745_soc.h
++++ b/include/hw/arm/stm32h745_soc.h
+@@ -9,6 +9,7 @@
+ 
+ #include "hw/arm/armv7m.h"
+ #include "hw/char/stm32h7_usart.h"
++#include "hw/display/stm32h7_ltdc.h"
+ #include "hw/gpio/stm32h7_gpio.h"
+ #include "hw/misc/stm32h7_rcc.h"
+ #include "hw/clock.h"
+@@ -40,7 +41,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(STM32H745State, STM32H745_SOC)
+ #define STM32H745_RCC_BASE       0x58024400
+ #define STM32H745_GPIOA_BASE     0x58020000
+ #define STM32H745_USART1_BASE    0x40011000
++#define STM32H745_LTDC_BASE      0x50001000
+ #define STM32H745_USART1_IRQ     37
++#define STM32H745_LTDC_IRQ       88
++#define STM32H745_LTDC_ER_IRQ    89
+ #define STM32H745_NUM_IRQ        150
+ 
+ struct STM32H745State {
+@@ -51,6 +55,7 @@ struct STM32H745State {
+     STM32H7RccState rcc;
+     STM32H7GpioState gpio[STM32H745_NUM_GPIO];
+     STM32H7UsartState usart1;
++    STM32H7LtdcState ltdc;
+ 
+     MemoryRegion flash;
+     MemoryRegion flash_alias;
+diff --git a/include/hw/display/stm32h7_ltdc.h b/include/hw/display/stm32h7_ltdc.h
+new file mode 100644
+index 0000000..7ec842e
+--- /dev/null
++++ b/include/hw/display/stm32h7_ltdc.h
+@@ -0,0 +1,92 @@
++/*
++ * STM32H7 LTDC (LCD-TFT Display Controller) — single-layer scanout
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_DISPLAY_STM32H7_LTDC_H
++#define HW_DISPLAY_STM32H7_LTDC_H
++
++#include "hw/sysbus.h"
++#include "ui/console.h"
++#include "qom/object.h"
++
++#define TYPE_STM32H7_LTDC "stm32h7-ltdc"
++OBJECT_DECLARE_SIMPLE_TYPE(STM32H7LtdcState, STM32H7_LTDC)
++
++/* Global registers */
++#define LTDC_SSCR   0x08
++#define LTDC_BPCR   0x0C
++#define LTDC_AWCR   0x10
++#define LTDC_TWCR   0x14
++#define LTDC_GCR    0x18
++#define LTDC_SRCR   0x24
++#define LTDC_BCCR   0x2C
++#define LTDC_IER    0x34
++#define LTDC_ISR    0x38
++#define LTDC_ICR    0x3C
++#define LTDC_LIPCR  0x40
++#define LTDC_CPSR   0x44
++#define LTDC_CDSR   0x48
++
++/* Layer 1 */
++#define LTDC_L1CR      0x84
++#define LTDC_L1WHPCR   0x88
++#define LTDC_L1WVPCR   0x8C
++#define LTDC_L1CKCR    0x90
++#define LTDC_L1PFCR    0x94
++#define LTDC_L1CACR    0x98
++#define LTDC_L1DCCR    0x9C
++#define LTDC_L1BFCR    0xA0
++#define LTDC_L1CFBAR   0xAC
++#define LTDC_L1CFBLR   0xB0
++#define LTDC_L1CFBLNR  0xB4
++#define LTDC_L1CLUTWR  0xC4
++
++#define LTDC_GCR_LTDCEN   (1u << 0)
++#define LTDC_SRCR_IMR     (1u << 0)
++#define LTDC_SRCR_VBR     (1u << 1)
++#define LTDC_L1CR_LEN     (1u << 0)
++
++/* PFCR pixel format */
++#define LTDC_PF_ARGB8888  0
++#define LTDC_PF_RGB888    1
++#define LTDC_PF_RGB565    2
++#define LTDC_PF_ARGB1555  3
++#define LTDC_PF_ARGB4444  4
++
++struct STM32H7LtdcState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    QemuConsole *con;
++    QEMUTimer *vblank_timer;
++    qemu_irq irq;
++    qemu_irq irq_err;
++
++    uint32_t sscr;
++    uint32_t bpcr;
++    uint32_t awcr;
++    uint32_t twcr;
++    uint32_t gcr;
++    uint32_t bccr;
++    uint32_t ier;
++    uint32_t isr;
++    uint32_t lipcr;
++
++    uint32_t l1cr;
++    uint32_t l1whpcr;
++    uint32_t l1wvpcr;
++    uint32_t l1ckcr;
++    uint32_t l1pfcr;
++    uint32_t l1cacr;
++    uint32_t l1dccr;
++    uint32_t l1bfcr;
++    uint32_t l1cfbar;
++    uint32_t l1cfblr;
++    uint32_t l1cfblnr;
++
++    int invalidate;
++};
++
++#endif /* HW_DISPLAY_STM32H7_LTDC_H */
+-- 
+2.54.0
+

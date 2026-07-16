@@ -1,0 +1,12 @@
+# Full QEMU checkout + build (created by scripts/ensure-qemu.sh)
+/qemu
+/qemu-install
+/.deps
+
+# Local stamp
+**/.armos-qemu-ready
+
+# Built smoke guests
+/tests/smoke/*.elf
+/tests/smoke/*.bin
+/tests/smoke/*.o

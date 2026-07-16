@@ -1,1 +1,6 @@
 /target
+
+# Custom QEMU build tree (created by qemu-stm32h745/scripts/ensure-qemu.sh)
+/qemu-stm32h745/qemu/
+/qemu-stm32h745/qemu-install/
+/qemu-stm32h745/.deps/
