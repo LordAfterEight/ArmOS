@@ -9,6 +9,8 @@ const MAX_BACKTRACE_FRAMES: usize = 16;
 #[cfg(not(feature = "probe-panic"))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    ArmOS::board::gpio::PE2.into_output().set_low();
+    ArmOS::board::gpio::PE5.into_output().set_high();
     ArmOS::print!("PANIC");
 
     if let Some(loc) = info.location() {
@@ -55,5 +57,13 @@ fn print_backtrace() {
 
 #[cfg(not(feature = "probe-panic"))]
 fn fp_in_dtcm(fp: usize) -> bool {
-    fp >= 0x2000_0000 && fp < 0x2002_0000
+    // QEMU mps2 SSRAM is larger; hardware DTCM is 128K at 0x2000_0000.
+    #[cfg(feature = "mps2")]
+    {
+        fp >= 0x2000_0000 && fp < 0x2040_0000
+    }
+    #[cfg(not(feature = "mps2"))]
+    {
+        fp >= 0x2000_0000 && fp < 0x2002_0000
+    }
 }

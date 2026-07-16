@@ -1,18 +1,18 @@
-#![cfg_attr(feature = "qemu", allow(dead_code))]
+#![cfg_attr(feature = "mps2", allow(dead_code))]
 
 use core::fmt::{self, Write};
 
-#[cfg(not(feature = "qemu"))]
+#[cfg(not(feature = "mps2"))]
 use crate::board;
 
-#[cfg(not(feature = "qemu"))]
+#[cfg(not(feature = "mps2"))]
 use super::clock;
-#[cfg(not(feature = "qemu"))]
+#[cfg(not(feature = "mps2"))]
 use super::gpio;
-#[cfg(not(feature = "qemu"))]
+#[cfg(not(feature = "mps2"))]
 use super::pac::{self, device};
 
-#[cfg(feature = "qemu")]
+#[cfg(feature = "mps2")]
 use super::semihost;
 
 struct UartWriter;
@@ -25,16 +25,16 @@ impl Write for UartWriter {
 }
 
 pub fn init() {
-    #[cfg(feature = "qemu")]
+    #[cfg(feature = "mps2")]
     {
         return;
     }
 
-    #[cfg(not(feature = "qemu"))]
+    #[cfg(not(feature = "mps2"))]
     init_hw();
 }
 
-#[cfg(not(feature = "qemu"))]
+#[cfg(not(feature = "mps2"))]
 fn init_hw() {
     // Single-core bring-up: steal after reset (no allocator/concurrency yet).
     let dp = unsafe { device::Peripherals::steal() };
@@ -53,23 +53,23 @@ fn init_hw() {
 }
 
 pub fn write_str(s: &str) {
-    #[cfg(feature = "qemu")]
+    #[cfg(feature = "mps2")]
     semihost::write_str(s);
 
-    #[cfg(not(feature = "qemu"))]
+    #[cfg(not(feature = "mps2"))]
     for &b in s.as_bytes() {
         write_byte(b);
     }
 }
 
 pub fn write_byte(b: u8) {
-    #[cfg(feature = "qemu")]
+    #[cfg(feature = "mps2")]
     {
         let one = [b];
         semihost::write_str(core::str::from_utf8(&one).unwrap_or(""));
     }
 
-    #[cfg(not(feature = "qemu"))]
+    #[cfg(not(feature = "mps2"))]
     {
         let usart1 = pac::usart1();
         while usart1.isr().read().txe().bit_is_clear() {}

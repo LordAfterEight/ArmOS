@@ -1,0 +1,484 @@
+//! Stage-0 bootloader: MCU flash + DTCM only.
+//!
+//! **Same sequence on silicon and on `stm32h745-carrier` QEMU** — no shortcuts.
+//! QEMU will not map SDRAM/NOR until every step below is done.
+//!
+//! 1. Enable GPIO clocks (RCC AHB4ENR) for ports used by FMC/QSPI
+//! 2. Pinmux FMC SDRAM bus (AF12) + QSPI (AF9/10) + NOR RESET# (PI11 high)
+//!    including **PG6 = QSPI NCS** (board bodge of schematic `QSPI_NCS`)
+//! 3. Enable FMC + QUADSPI clocks (RCC AHB3ENR)
+//! 4. FMC SDRAM bank1 init: CLOCK → PALL → AUTOREF → LOAD_MODE
+//! 5. QUADSPI memory-mapped mode (DCR.FSIZE, CCR.FMODE=11, CR.EN)
+//! 6. Validate NOR vectors; if bad → ERR LED + red LTDC screen, never jump
+//! 7. Else RUN LED on, jump to ArmOS @ 0x90000000
+//!
+//! Board: STM32H745BITx + IS25LP01GJ (QSPI) + AS4C32M16SB (FMC SDRAM).
+//! Status LEDs (anode ← GPIO, active high): PE2=RUN PE3=DBG PE4=ERR PE5=PNC.
+
+#![no_std]
+#![no_main]
+
+const OS_VECTOR_TABLE: u32 = 0x9000_0000;
+
+/* ── RCC ─────────────────────────────────────────────────────────── */
+const RCC_AHB3ENR: *mut u32 = 0x5802_44D4 as *mut u32;
+const RCC_AHB4ENR: *mut u32 = 0x5802_44E0 as *mut u32;
+const RCC_AHB3ENR_FMCEN: u32 = 1 << 12;
+const RCC_AHB3ENR_QSPIEN: u32 = 1 << 14;
+const RCC_AHB4ENR_GPIOCEN: u32 = 1 << 2;
+const RCC_AHB4ENR_GPIODEN: u32 = 1 << 3;
+const RCC_AHB4ENR_GPIOEEN: u32 = 1 << 4;
+const RCC_AHB4ENR_GPIOFEN: u32 = 1 << 5;
+const RCC_AHB4ENR_GPIOGEN: u32 = 1 << 6;
+const RCC_AHB4ENR_GPIOHEN: u32 = 1 << 7;
+const RCC_AHB4ENR_GPIOIEN: u32 = 1 << 8;
+
+/* ── GPIO bases ──────────────────────────────────────────────────── */
+const GPIOC: usize = 0x5802_0800;
+const GPIOD: usize = 0x5802_0C00;
+const GPIOE: usize = 0x5802_1000;
+const GPIOF: usize = 0x5802_1400;
+const GPIOG: usize = 0x5802_1800;
+const GPIOH: usize = 0x5802_1C00;
+const GPIOI: usize = 0x5802_2000;
+
+const GPIO_MODER: usize = 0x00;
+const GPIO_OSPEEDR: usize = 0x08;
+const GPIO_ODR: usize = 0x14;
+const GPIO_BSRR: usize = 0x18;
+const GPIO_AFRL: usize = 0x20;
+const GPIO_AFRH: usize = 0x24;
+
+const MODE_OUTPUT: u32 = 0b01;
+const MODE_AF: u32 = 0b10;
+const SPEED_VERY_HIGH: u32 = 0b11;
+const AF_FMC: u32 = 12;
+const AF_QSPI_9: u32 = 9;
+const AF_QSPI_10: u32 = 10;
+
+/* ── FMC SDRAM ───────────────────────────────────────────────────── */
+const FMC_SDCR1: *mut u32 = 0x5200_4140 as *mut u32;
+const FMC_SDTR1: *mut u32 = 0x5200_4148 as *mut u32;
+const FMC_SDCMR: *mut u32 = 0x5200_4150 as *mut u32;
+const FMC_SDRTR: *mut u32 = 0x5200_4154 as *mut u32;
+const FMC_SDSR: *const u32 = 0x5200_4158 as *const u32;
+const FMC_SDCMR_CTB1: u32 = 1 << 4;
+
+/* ── QUADSPI ─────────────────────────────────────────────────────── */
+const QUADSPI_CR: *mut u32 = 0x5200_5000 as *mut u32;
+const QUADSPI_DCR: *mut u32 = 0x5200_5004 as *mut u32;
+const QUADSPI_CCR: *mut u32 = 0x5200_5014 as *mut u32;
+const QUADSPI_CR_EN: u32 = 1 << 0;
+const QUADSPI_CCR_FMODE_MEMMAP: u32 = 3 << 26;
+
+/* ── Status LEDs (carrier D4–D7) ─────────────────────────────────── */
+const LED_RUN: u32 = 2; // PE2
+const LED_DBG: u32 = 3; // PE3
+const LED_ERR: u32 = 4; // PE4
+const LED_PNC: u32 = 5; // PE5
+
+/* ── LTDC (fail screen only; OS owns full bring-up later) ────────── */
+const RCC_APB3ENR: *mut u32 = 0x5802_44E4 as *mut u32;
+const RCC_APB3ENR_LTDCEN: u32 = 1 << 3;
+const LTDC_BASE: usize = 0x5000_1000;
+const FB_BASE: u32 = 0xC000_0000;
+const FB_W: u32 = 800;
+const FB_H: u32 = 480;
+const FB_STRIDE: u32 = FB_W * 4;
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    // Best-effort: PE5 PANIC high if GPIOE is already clocked.
+    unsafe {
+        gpio_set_output_level(GPIOE, LED_PNC, true);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+core::arch::global_asm!(
+    r#"
+    .section .vector_table, "a"
+    .word _estack
+    .word Reset
+    .word DefaultHandler
+    .word DefaultHandler
+    .word DefaultHandler
+    .word DefaultHandler
+    .word DefaultHandler
+    .word 0
+    .word 0
+    .word 0
+    .word 0
+    .word DefaultHandler
+    .word DefaultHandler
+    .word 0
+    .word DefaultHandler
+    .word DefaultHandler
+    .rept 149
+    .word DefaultHandler
+    .endr
+    "#,
+);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn DefaultHandler() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+unsafe extern "C" {
+    static _sidata: u32;
+    static mut _sdata: u32;
+    static _edata: u32;
+    static mut _sbss: u32;
+    static _ebss: u32;
+}
+
+#[inline(always)]
+unsafe fn reg_write(addr: *mut u32, val: u32) {
+    unsafe { core::ptr::write_volatile(addr, val) }
+}
+
+#[inline(always)]
+unsafe fn reg_read(addr: *const u32) -> u32 {
+    unsafe { core::ptr::read_volatile(addr) }
+}
+
+#[inline(always)]
+unsafe fn gpio_reg(port: usize, off: usize) -> *mut u32 {
+    (port + off) as *mut u32
+}
+
+/// Set pin mode (2 bits in MODER) and optional AFR / speed.
+unsafe fn gpio_set_pin(port: usize, pin: u32, mode: u32, af: u32) {
+    unsafe {
+        let moder = gpio_reg(port, GPIO_MODER);
+        let m = reg_read(moder);
+        reg_write(moder, (m & !(0b11 << (pin * 2))) | (mode << (pin * 2)));
+
+        let speed = gpio_reg(port, GPIO_OSPEEDR);
+        let sp = reg_read(speed);
+        reg_write(
+            speed,
+            (sp & !(0b11 << (pin * 2))) | (SPEED_VERY_HIGH << (pin * 2)),
+        );
+
+        if mode == MODE_AF {
+            if pin < 8 {
+                let afr = gpio_reg(port, GPIO_AFRL);
+                let a = reg_read(afr);
+                reg_write(afr, (a & !(0xF << (pin * 4))) | (af << (pin * 4)));
+            } else {
+                let afr = gpio_reg(port, GPIO_AFRH);
+                let shift = (pin - 8) * 4;
+                let a = reg_read(afr);
+                reg_write(afr, (a & !(0xF << shift)) | (af << shift));
+            }
+        }
+    }
+}
+
+unsafe fn gpio_set_output_level(port: usize, pin: u32, high: bool) {
+    unsafe {
+        gpio_set_pin(port, pin, MODE_OUTPUT, 0);
+        if high {
+            reg_write(gpio_reg(port, GPIO_BSRR), 1 << pin);
+        } else {
+            reg_write(gpio_reg(port, GPIO_BSRR), 1 << (pin + 16));
+        }
+        let _ = reg_read(gpio_reg(port, GPIO_ODR));
+    }
+}
+
+unsafe fn gpio_set_output_high(port: usize, pin: u32) {
+    unsafe {
+        gpio_set_output_level(port, pin, true);
+    }
+}
+
+/// Carrier status LEDs — PE2 RUN, PE3 DBG, PE4 ERR, PE5 PNC (active high).
+unsafe fn status_leds_init() {
+    unsafe {
+        for pin in [LED_RUN, LED_DBG, LED_ERR, LED_PNC] {
+            gpio_set_output_level(GPIOE, pin, false);
+        }
+    }
+}
+
+unsafe fn led_set(pin: u32, on: bool) {
+    unsafe {
+        gpio_set_output_level(GPIOE, pin, on);
+    }
+}
+
+/// Carrier pinmux — must match QEMU `carrier_*_pinmux_ok` checks.
+unsafe fn board_pinmux_init() {
+    unsafe {
+        /* ── QSPI: IS25LP01GJ ─────────────────────────────────────── */
+        gpio_set_pin(GPIOF, 6, MODE_AF, AF_QSPI_9); // IO3
+        gpio_set_pin(GPIOF, 7, MODE_AF, AF_QSPI_9); // IO2
+        gpio_set_pin(GPIOF, 8, MODE_AF, AF_QSPI_10); // IO0
+        gpio_set_pin(GPIOF, 9, MODE_AF, AF_QSPI_10); // IO1
+        gpio_set_pin(GPIOF, 10, MODE_AF, AF_QSPI_9); // CLK
+        gpio_set_pin(GPIOG, 6, MODE_AF, AF_QSPI_10); // NCS (bodge)
+        gpio_set_output_high(GPIOI, 11); // NOR RESET# released
+
+        /* ── FMC SDRAM: AS4C32M16SB ────────────────────────────────── */
+        for pin in 0u32..=5 {
+            gpio_set_pin(GPIOF, pin, MODE_AF, AF_FMC); // A0–A5
+        }
+        gpio_set_pin(GPIOF, 11, MODE_AF, AF_FMC); // RAS
+        for pin in 12u32..=15 {
+            gpio_set_pin(GPIOF, pin, MODE_AF, AF_FMC); // A6–A9
+        }
+        gpio_set_pin(GPIOG, 0, MODE_AF, AF_FMC); // A10
+        gpio_set_pin(GPIOG, 1, MODE_AF, AF_FMC); // A11
+        gpio_set_pin(GPIOG, 2, MODE_AF, AF_FMC); // A12
+        gpio_set_pin(GPIOG, 4, MODE_AF, AF_FMC); // BA0
+        gpio_set_pin(GPIOG, 5, MODE_AF, AF_FMC); // BA1
+        gpio_set_pin(GPIOG, 8, MODE_AF, AF_FMC); // SDCLK
+        gpio_set_pin(GPIOG, 15, MODE_AF, AF_FMC); // CAS
+        gpio_set_pin(GPIOC, 0, MODE_AF, AF_FMC); // WE
+        gpio_set_pin(GPIOC, 2, MODE_AF, AF_FMC); // SDNE0 / CS
+        gpio_set_pin(GPIOH, 7, MODE_AF, AF_FMC); // CKE
+        gpio_set_pin(GPIOE, 0, MODE_AF, AF_FMC); // NBL0
+        gpio_set_pin(GPIOE, 1, MODE_AF, AF_FMC); // NBL1
+        gpio_set_pin(GPIOD, 14, MODE_AF, AF_FMC); // D0
+        gpio_set_pin(GPIOD, 15, MODE_AF, AF_FMC); // D1
+        gpio_set_pin(GPIOD, 0, MODE_AF, AF_FMC); // D2
+        gpio_set_pin(GPIOD, 1, MODE_AF, AF_FMC); // D3
+        for pin in 7u32..=15 {
+            gpio_set_pin(GPIOE, pin, MODE_AF, AF_FMC); // D4–D12
+        }
+        gpio_set_pin(GPIOD, 8, MODE_AF, AF_FMC); // D13
+        gpio_set_pin(GPIOD, 9, MODE_AF, AF_FMC); // D14
+        gpio_set_pin(GPIOD, 10, MODE_AF, AF_FMC); // D15
+    }
+}
+
+unsafe fn fmc_wait_ready() {
+    unsafe {
+        while reg_read(FMC_SDSR) & 1 != 0 {}
+    }
+}
+
+/// FMC SDRAM bank1 init — RM0399 command order.
+unsafe fn fmc_sdram_init() {
+    unsafe {
+        // SDCR1: 16-bit, CAS2, 4 banks, 13 row / 9 col (match AS4C32M16 class)
+        reg_write(FMC_SDCR1, 0x0000_1959);
+        reg_write(FMC_SDTR1, 0x0111_5361);
+        fmc_wait_ready();
+
+        reg_write(FMC_SDCMR, FMC_SDCMR_CTB1 | 1); // CLOCK
+        fmc_wait_ready();
+        reg_write(FMC_SDCMR, FMC_SDCMR_CTB1 | 2); // PALL
+        fmc_wait_ready();
+        reg_write(FMC_SDCMR, FMC_SDCMR_CTB1 | (1 << 5) | 3); // AUTOREF
+        fmc_wait_ready();
+        reg_write(FMC_SDCMR, FMC_SDCMR_CTB1 | (0x220 << 9) | 4); // LOAD
+        fmc_wait_ready();
+
+        reg_write(FMC_SDRTR, 0x27C << 1);
+        fmc_wait_ready();
+    }
+}
+
+/// QUADSPI memory-mapped XIP for 128 MiB IS25LP01GJ (FSIZE=26).
+unsafe fn quadspi_enable_memmap() {
+    unsafe {
+        reg_write(QUADSPI_DCR, 26 << 16);
+        reg_write(QUADSPI_CCR, QUADSPI_CCR_FMODE_MEMMAP);
+        reg_write(QUADSPI_CR, QUADSPI_CR_EN);
+    }
+}
+
+#[inline(always)]
+unsafe fn ltdc_w(off: usize, val: u32) {
+    unsafe {
+        reg_write((LTDC_BASE + off) as *mut u32, val);
+    }
+}
+
+/// Solid red frame + LTDC enable so a failed NOR load is obvious on the panel.
+/// Timing matches the OS driver (800×480); no fonts in the bootloader.
+unsafe fn show_os_load_fail_screen() {
+    unsafe {
+        // Fill front buffer in SDRAM (must already be mapped).
+        let fb = FB_BASE as *mut u32;
+        let pixels = (FB_W * FB_H) as usize;
+        let red = 0x00C0_0020u32;
+        let band = 0x00FF_4040u32;
+        for i in 0..pixels {
+            let y = (i as u32) / FB_W;
+            // Horizontal stripe so it is not a flat “dead” window.
+            let c = if (y / 40) % 2 == 0 { red } else { band };
+            core::ptr::write_volatile(fb.add(i), c);
+        }
+
+        let apb3 = reg_read(RCC_APB3ENR);
+        reg_write(RCC_APB3ENR, apb3 | RCC_APB3ENR_LTDCEN);
+        let _ = reg_read(RCC_APB3ENR);
+
+        // Same (N-1) timing encoding as ArmOS ltdc driver.
+        let hsync = 48u32;
+        let hbp = 40u32;
+        let hfp = 40u32;
+        let vsync = 1u32;
+        let vbp = 31u32;
+        let vfp = 13u32;
+        let aw = FB_W;
+        let ah = FB_H;
+        let hsw = hsync - 1;
+        let vsh = vsync - 1;
+        let ahbp = hsync + hbp - 1;
+        let avbp = vsync + vbp - 1;
+        let aaw = hsync + hbp + aw - 1;
+        let aah = vsync + vbp + ah - 1;
+        let totalw = hsync + hbp + aw + hfp - 1;
+        let totalh = vsync + vbp + ah + vfp - 1;
+
+        ltdc_w(0x08, (hsw << 16) | vsh); // SSCR
+        ltdc_w(0x0C, (ahbp << 16) | avbp); // BPCR
+        ltdc_w(0x10, (aaw << 16) | aah); // AWCR
+        ltdc_w(0x14, (totalw << 16) | totalh); // TWCR
+        ltdc_w(0x2C, 0); // BCCR black
+
+        let whst = hsync + hbp;
+        let whsp = hsync + hbp + aw - 1;
+        let wvst = vsync + vbp;
+        let wvsp = vsync + vbp + ah - 1;
+        ltdc_w(0x88, (whsp << 16) | whst); // L1WHPCR
+        ltdc_w(0x8C, (wvsp << 16) | wvst); // L1WVPCR
+        ltdc_w(0x94, 0); // L1PFCR ARGB8888
+        ltdc_w(0x98, 0xFF); // L1CACR
+        ltdc_w(0xA0, 0x607); // L1BFCR
+        ltdc_w(0xAC, FB_BASE); // L1CFBAR
+        ltdc_w(0xB0, (FB_STRIDE << 16) | (FB_STRIDE + 3)); // L1CFBLR
+        ltdc_w(0xB4, FB_H); // L1CFBLNR
+        ltdc_w(0x84, 1); // L1CR LEN
+        ltdc_w(0x24, 1); // SRCR IMR
+        ltdc_w(0x18, 0x2221); // GCR LTDCEN | reset defaults
+    }
+}
+
+fn os_vectors_look_valid(msp: u32, reset: u32) -> bool {
+    // Stack in SDRAM window (bootloader maps 64 MiB @ 0xC0000000).
+    let msp_ok = (0xC000_0000..=0xC400_0000).contains(&msp) && (msp & 7) == 0;
+    // Reset in NOR XIP, Thumb bit set, not erased flash pattern.
+    let reset_ok = (0x9000_0000..0x9800_0000).contains(&(reset & !1))
+        && (reset & 1) == 1
+        && reset != 0xFFFF_FFFF;
+    msp_ok && reset_ok
+}
+
+/// Fatal: bad/empty NOR image. Stay in bootloader with ERR LED + panel.
+unsafe fn halt_os_load_failed() -> ! {
+    unsafe {
+        led_set(LED_RUN, false);
+        led_set(LED_DBG, false);
+        led_set(LED_ERR, true);
+        led_set(LED_PNC, false);
+        show_os_load_fail_screen();
+        loop {
+            // Slow blink ERR so a stuck boot is visible on the LED window too.
+            led_set(LED_ERR, true);
+            for _ in 0..400_000 {
+                core::hint::spin_loop();
+            }
+            led_set(LED_ERR, false);
+            for _ in 0..400_000 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Reset() -> ! {
+    unsafe {
+        /* .data / .bss in DTCM */
+        let mut dst = core::ptr::addr_of_mut!(_sdata) as usize;
+        let mut src = core::ptr::addr_of!(_sidata) as usize;
+        let end = core::ptr::addr_of!(_edata) as usize;
+        while dst < end {
+            core::ptr::write_volatile(dst as *mut u32, core::ptr::read_volatile(src as *const u32));
+            dst = dst.wrapping_add(4);
+            src = src.wrapping_add(4);
+        }
+        let mut b = core::ptr::addr_of_mut!(_sbss) as usize;
+        let bend = core::ptr::addr_of!(_ebss) as usize;
+        while b < bend {
+            core::ptr::write_volatile(b as *mut u32, 0);
+            b = b.wrapping_add(4);
+        }
+
+        // 1) GPIO clocks first (required before MODER/AFR take effect on silicon)
+        let ahb4 = reg_read(RCC_AHB4ENR);
+        reg_write(
+            RCC_AHB4ENR,
+            ahb4 | RCC_AHB4ENR_GPIOCEN
+                | RCC_AHB4ENR_GPIODEN
+                | RCC_AHB4ENR_GPIOEEN
+                | RCC_AHB4ENR_GPIOFEN
+                | RCC_AHB4ENR_GPIOGEN
+                | RCC_AHB4ENR_GPIOHEN
+                | RCC_AHB4ENR_GPIOIEN,
+        );
+        let _ = reg_read(RCC_AHB4ENR);
+
+        // Status LEDs early (DBG = “bringing up”)
+        status_leds_init();
+        led_set(LED_DBG, true);
+
+        // 2) Board pinmux (FMC + QSPI + NOR reset)
+        board_pinmux_init();
+
+        // 3) Peripheral clocks
+        let ahb3 = reg_read(RCC_AHB3ENR);
+        reg_write(
+            RCC_AHB3ENR,
+            ahb3 | RCC_AHB3ENR_FMCEN | RCC_AHB3ENR_QSPIEN,
+        );
+        let _ = reg_read(RCC_AHB3ENR);
+
+        // 4) External SDRAM
+        fmc_sdram_init();
+
+        // 5) NOR XIP window
+        quadspi_enable_memmap();
+
+        // 6) Handoff or fail UI
+        jump_to_os();
+    }
+}
+
+unsafe fn jump_to_os() -> ! {
+    unsafe {
+        let vtor = OS_VECTOR_TABLE as *const u32;
+        let msp = core::ptr::read_volatile(vtor);
+        let reset = core::ptr::read_volatile(vtor.add(1));
+
+        if !os_vectors_look_valid(msp, reset) {
+            halt_os_load_failed();
+        }
+
+        led_set(LED_DBG, false);
+        led_set(LED_ERR, false);
+        led_set(LED_RUN, true);
+
+        const SCB_VTOR: *mut u32 = 0xE000_ED08 as *mut u32;
+        core::ptr::write_volatile(SCB_VTOR, OS_VECTOR_TABLE);
+
+        core::arch::asm!(
+            "msr msp, {msp}",
+            "bx {reset}",
+            msp = in(reg) msp,
+            reset = in(reg) reset,
+            options(noreturn),
+        );
+    }
+}

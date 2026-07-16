@@ -1,21 +1,25 @@
-/* Legacy mps2-an500 + PSRAM stand-in for SDRAM experiments.
- * Prefer default build + stm32h745-carrier for real layout.
+/*
+ * Stage-0 bootloader — MCU internal flash + DTCM only.
  *
- * Heap symbols required by lib.rs bump allocator.
+ * Responsibilities:
+ *   - Bring-up clocks / FMC / QUADSPI as needed (stubs for now under QEMU)
+ *   - Jump to ArmOS vector table in NOR (XIP @ 0x90000000)
+ *
+ * Must not depend on SDRAM, NAND, or OS heap.
  */
 ENTRY(Reset)
 
 MEMORY
 {
-    FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 4096K
-    RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = 4096K
+    FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 128K
+    RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = 64K
 }
 
 _estack = ORIGIN(RAM) + LENGTH(RAM);
 
-/* PSRAM after FB_RESERVE 0x2F0000 — absolute, matches board mps2 MAIN_RAM */
-_heap_start = 0x602F0000;
-_heap_end   = 0x61000000; /* 16 MiB PSRAM end */
+/* Unused by bootloader, but keep symbols defined if linked against stubs */
+_heap_start = .;
+_heap_end = .;
 
 SECTIONS
 {

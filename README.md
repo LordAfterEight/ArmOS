@@ -10,11 +10,19 @@ cd ArmOS
 cargo run --release
 ```
 
+Boot architecture:
+
+```text
+MCU flash  →  bootloader  →  jumps to NOR
+NOR (XIP)  →  ArmOS       →  uses FMC SDRAM as main RAM
+```
+
 The first `cargo build` / `cargo run`:
 
-1. Builds the firmware with the **hardware memory map** (flash `@ 0x08000000`).
-2. Fetches QEMU **v10.1.0**, applies patches under `qemu-stm32h745/patches/`, and compiles `qemu-system-arm` with **`stm32h745-carrier`** (cached under `qemu-stm32h745/qemu/`, gitignored).
-3. Launches the ELF with USART on stdio and an SDL window for LTDC (800×480).
+1. Builds **bootloader** (MCU flash `@ 0x08000000`, DTCM only) and **ArmOS** (NOR XIP `@ 0x90000000`, SDRAM RAM).
+2. Fetches/builds in-tree QEMU with **`stm32h745-carrier`**.
+3. Runs: `-kernel bootloader` + `-machine …,os-image=ArmOS` (serial + SDL LTDC).
+   NOR/SDRAM stay unmapped until the bootloader enables FMC + QUADSPI.
 
 ### Host packages (Fedora)
 
@@ -30,28 +38,42 @@ Without root, `qemu-stm32h745/scripts/bootstrap-deps.sh` can stage headers into 
 
 | Command | Meaning |
 |---------|---------|
-| `cargo run --release` | Build + run on `stm32h745-carrier` |
-| `cargo build --release` | Build firmware (+ ensure QEMU exists) |
-| `cargo hw` | Alias: release build for flashing |
-| `cargo mps2` | Legacy `mps2-an500` + semihosting (system QEMU) |
-| `ARMOS_SKIP_QEMU_BUILD=1 cargo build` | Firmware only; do not fetch/build QEMU |
-| `ARMOS_QEMU_DISPLAY=none cargo run --release` | Headless (no SDL window) |
+| `cargo run --release` | Bootloader + OS on `stm32h745-carrier` |
+| `cargo build --release --bin bootloader --bin ArmOS` | Both images |
+| `cargo hw` | Release OS image (for NOR programming) |
+| `cargo mps2` | Legacy `mps2-an500` + semihosting |
+| `ARMOS_QEMU_DISPLAY=none cargo run --release` | Headless |
 
-### Flash to hardware
+### Manual QEMU (any OS ELF linked for NOR)
 
 ```bash
-cargo build --release   # produces target/thumbv7em-none-eabihf/release/ArmOS.{elf,bin,hex}
-# then probe-rs / openocd / your SWD tool
+./qemu-stm32h745/scripts/ensure-qemu.sh
+export LD_LIBRARY_PATH="$PWD/qemu-stm32h745/.deps/prefix/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+qemu-stm32h745/qemu/build/qemu-system-arm \
+  -machine stm32h745-carrier,os-image=target/thumbv7em-none-eabihf/release/ArmOS \
+  -kernel target/thumbv7em-none-eabihf/release/bootloader \
+  -serial mon:stdio -display sdl
 ```
+
+### Flash to hardware (SWD + IS25LP01GJ)
+
+See **[docs/flashing.md](docs/flashing.md)** and **[qemu-stm32h745/docs/board-carrier.md](qemu-stm32h745/docs/board-carrier.md)** (pinmux from netlist).
+
+1. **Fix `QSPI_NCS`** on the schematic (CE# is currently not wired to the MCU)
+2. Program **bootloader** → MCU flash `@ 0x08000000` via J4 SWD
+3. Program **ArmOS** → **IS25LP01GJ** NOR via QSPI (external loader or one-shot burner)
+4. Reset → bootloader → XIP `@ 0x90000000` + SDRAM
 
 ## Layout
 
 | Path | Role |
 |------|------|
-| `src/` | Kernel / drivers / UI |
-| `linker.ld` | Hardware + custom QEMU map |
-| `linker-qemu.ld` | Legacy mps2 map (`--features mps2`) |
-| `qemu-stm32h745/` | Custom QEMU machine (patches + scripts) |
+| `src/bin/bootloader.rs` | Stage-0 (MCU flash) |
+| `src/main.rs` | ArmOS entry (NOR XIP) |
+| `linker-boot.ld` | Bootloader: MCU flash + DTCM |
+| `linker.ld` | OS: NOR + SDRAM |
+| `qemu-stm32h745/` | Custom QEMU machine |
 | `scripts/qemu-run.sh` | Cargo runner |
 
-See `qemu-stm32h745/docs/how-the-machine-works.md` for how the emulator machine works.
+See `qemu-stm32h745/docs/memory-map.md` and `how-the-machine-works.md`.

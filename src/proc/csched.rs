@@ -4,13 +4,13 @@ use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::convert::From;
+use core::iter::Iterator;
 use core::option::Option::*;
 use core::result::Result;
-use core::iter::Iterator;
-use core::convert::From;
 
-use crate::klog::{log, MessageType};
-use crate::proc::registry::{ProcTableEntry, PROCESS_TABLE};
+use crate::klog::{MessageType, log};
+use crate::proc::registry::{PROCESS_TABLE, ProcTableEntry};
 use crate::proc::{IpcData, Process, ProcessError, ProcessEvent, ProcessStatus};
 
 pub static SCHEDULER_COMMAND_QUEUE: spin::Mutex<VecDeque<SchedulerTask>> =
@@ -113,24 +113,21 @@ impl CooperativeScheduler {
                     let entry = match self.procs.iter_mut().find(|p| p.pid() == target_pid) {
                         Some(entry) => entry,
                         None => {
-                            _ = self.procs[sender_pid as usize].receive(IpcData::SendError(
-                                format!("Invalid PID: {target_pid}"),
-                            ));
+                            _ = self.procs[sender_pid as usize]
+                                .receive(IpcData::SendError(format!("Invalid PID: {target_pid}")));
                             continue;
                         }
                     };
                     match entry.receive(data) {
                         Result::Ok(_) => {
-                            let _ = self.procs[sender_pid as usize].receive(
-                                IpcData::SendConfirmation(String::from(
-                                    "Payload sent successfully",
-                                )),
-                            );
+                            let _ =
+                                self.procs[sender_pid as usize].receive(IpcData::SendConfirmation(
+                                    String::from("Payload sent successfully"),
+                                ));
                         }
                         Result::Err(e) => {
-                            let _ = self.procs[sender_pid as usize].receive(
-                                IpcData::SendError(format!("Send failed: {e:?}")),
-                            );
+                            let _ = self.procs[sender_pid as usize]
+                                .receive(IpcData::SendError(format!("Send failed: {e:?}")));
                         }
                     }
                 }
@@ -138,9 +135,8 @@ impl CooperativeScheduler {
                     let entry = match self.procs.iter_mut().find(|p| p.pid() == target_pid) {
                         Some(entry) => entry,
                         None => {
-                            _ = self.procs[sender_pid as usize].receive(IpcData::SendError(
-                                format!("Invalid PID: {target_pid}"),
-                            ));
+                            _ = self.procs[sender_pid as usize]
+                                .receive(IpcData::SendError(format!("Invalid PID: {target_pid}")));
                             continue;
                         }
                     };
@@ -179,11 +175,7 @@ impl CooperativeScheduler {
                             PROCESS_TABLE.lock().retain(|e| e.pid != proc.pid());
                             log(
                                 "Cooperative Scheduler",
-                                &format!(
-                                    "Process closed: {} | PID {}",
-                                    proc.name(),
-                                    proc.pid()
-                                ),
+                                &format!("Process closed: {} | PID {}", proc.name(), proc.pid()),
                                 MessageType::Error,
                             );
                             proc.on_uninit();
@@ -199,11 +191,7 @@ impl CooperativeScheduler {
 
                 let pid = self.procs[i].pid();
                 let status = self.procs[i].status();
-                if let Some(entry) = PROCESS_TABLE
-                    .lock()
-                    .iter_mut()
-                    .find(|e| e.pid == pid)
-                {
+                if let Some(entry) = PROCESS_TABLE.lock().iter_mut().find(|e| e.pid == pid) {
                     entry.status = status;
                 }
                 i += 1;

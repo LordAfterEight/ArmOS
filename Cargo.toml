@@ -3,16 +3,19 @@ name = "ArmOS"
 version = "0.1.0"
 edition = "2024"
 build = "build.rs"
+default-run = "ArmOS"
 
 [features]
-# Default: hardware MMIO map (linker.ld @ 0x08000000) for real H745 *and*
-# the in-tree stm32h745-carrier QEMU machine (`cargo run`).
+# Default ArmOS: XIP from QUADSPI NOR, main RAM = FMC SDRAM.
+# `cargo run` loads the bootloader (MCU flash) + this image (NOR) in QEMU.
 #
-# Optional legacy mps2-an500 + semihosting (no custom QEMU needed):
+# Legacy mps2-an500 + semihosting:
 #   cargo run --features mps2
 default = []
 mps2 = []
 probe-panic = ["dep:panic-probe", "dep:cortex-m"]
+# Allow into_output/into_input on pins hardwired to FMC/QSPI/SWD/etc.
+gpio-allow-hardwired = []
 
 [lib]
 path = "src/lib.rs"
@@ -35,5 +38,12 @@ panic = "abort"
 [[bin]]
 name = "ArmOS"
 path = "src/main.rs"
+test = false
+bench = false
+
+# Stage-0: MCU internal flash + DTCM only; jumps to ArmOS in NOR.
+[[bin]]
+name = "bootloader"
+path = "src/bin/bootloader.rs"
 test = false
 bench = false

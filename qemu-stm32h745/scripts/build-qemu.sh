@@ -9,7 +9,7 @@ PREFIX_DEPS="${ROOT}/.deps/prefix"
 INSTALL="${ROOT}/qemu-install"
 
 if [[ ! -d "${QEMU_SRC}" ]]; then
-  echo "echo "error: no QEMU sources; run fetch-qemu.sh first" >&2
+  echo "error: no QEMU sources; run fetch-qemu.sh first" >&2
   exit 1
 fi
 
@@ -26,11 +26,11 @@ fi
 cd "${QEMU_SRC}"
 
 if [[ ! -f "${BUILD}/build.ninja" ]]; then
-  echo "echo "==> configuring QEMU (arm-softmmu)" >&2
+  echo "==> configuring QEMU (arm-softmmu)" >&2
   SDL_FLAG="--enable-sdl"
   if ! pkg-config --exists sdl2 2>/dev/null; then
     SDL_FLAG="--disable-sdl"
-    echo "echo "==> SDL2 not found; building without host window (-display none only)" >&2
+    echo "==> SDL2 not found; building without host window" >&2
   fi
   # shellcheck disable=SC2086
   ./configure \
@@ -44,19 +44,19 @@ if [[ ! -f "${BUILD}/build.ninja" ]]; then
     ${EXTRA_LDFLAGS:+--extra-ldflags="${EXTRA_LDFLAGS}"}
 fi
 
-echo "echo "==> building qemu-system-arm (first time can take several minutes)" >&2
+echo "==> building qemu-system-arm" >&2
 ninja -C "${BUILD}" -j"$(nproc)"
 
 BIN="${BUILD}/qemu-system-arm"
 if [[ ! -x "${BIN}" ]]; then
-  echo "echo "error: build finished but ${BIN} missing" >&2
+  echo "error: build finished but ${BIN} missing" >&2
   exit 1
 fi
 
 export LD_LIBRARY_PATH="${PREFIX_DEPS}/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 if ! "${BIN}" -machine help 2>/dev/null | grep -q 'stm32h745-carrier'; then
-  echo "echo "error: stm32h745-carrier not registered in built QEMU" >&2
+  echo "error: stm32h745-carrier not registered" >&2
   exit 1
 fi
 
-echo "echo "==> ready: ${BIN}" >&2
+echo "==> ready: ${BIN}" >&2

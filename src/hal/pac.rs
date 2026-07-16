@@ -13,3 +13,9 @@ pub fn usart1() -> &'static device::usart1::RegisterBlock {
 pub fn rcc() -> &'static device::rcc::RegisterBlock {
     unsafe { &*device::RCC::ptr() }
 }
+
+/// Returns a pointer to the LTDC peripheral registers.
+#[inline(always)]
+pub fn ltdc() -> &'static device::ltdc::RegisterBlock {
+    unsafe { &*device::LTDC::ptr() }
+}

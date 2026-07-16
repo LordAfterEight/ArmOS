@@ -1,23 +1,60 @@
-# Memory map — STM32H745 carrier (QEMU model)
+# Memory map — STM32H745 carrier
 
-| Region | Base | Size | Notes |
-|--------|------|------|--------|
-| Flash alias (boot) | `0x00000000` | 2 MiB | Alias of main flash for reset vectors |
-| Flash | `0x08000000` | 2 MiB | `-kernel` load region |
-| DTCM | `0x20000000` | 128 KiB | Default ArmOS stack/data |
-| AXI SRAM | `0x24000000` | 512 KiB | |
-| SRAM1 | `0x30000000` | 128 KiB | |
-| SRAM2 | `0x30020000` | 128 KiB | |
-| SRAM3 | `0x30040000` | 32 KiB | |
-| SRAM4 | `0x38000000` | 64 KiB | |
-| FMC SDRAM bank1 | `0xC0000000` | 64 MiB | AS4C32M16SB; FB base for LTDC |
+## Boot architecture
 
-## Peripherals (implemented subset)
+```text
+ Power-on / reset
+        │
+        ▼
+ MCU internal flash @ 0x08000000     stage-0 bootloader (DTCM stack)
+        │  optional: clocks, FMC, QUADSPI init
+        ▼
+ QUADSPI NOR @ 0x90000000 (XIP)      ArmOS image (vectors + .text + .rodata)
+        │
+        ▼
+ FMC SDRAM @ 0xC0000000              OS main RAM
+ FMC NAND  @ 0x80000000              mass storage (FS later)
+```
 
-| Device | Base | Model |
-|--------|------|--------|
-| USART1 | `0x40011000` | `stm32h7-usart` |
-| GPIOA–K | `0x58020000` + `0x400 * n` | `stm32h7-gpio` |
-| RCC | `0x58024400` | `stm32h7-rcc` |
+| Resource | Who uses it |
+|----------|-------------|
+| MCU ROM (2 MiB `@ 0x08000000`) | **Bootloader only** |
+| MCU RAM (DTCM / AXI SRAM / …) | **Bootloader only** |
+| **NOR 128 MiB** `@ 0x90000000` | **OS code (XIP)** |
+| **SDRAM 64 MiB** `@ 0xC0000000` | **OS main RAM** |
+| **NAND 512 MiB** `@ 0x80000000` | **OS storage** |
 
-Unimplemented windows (PWR, EXTI, SYSCFG, FLASH IF, FMC, LTDC, I2C3, TIMx, ADC, DMA, …) are stubs via `create_unimplemented_device` so guest probes do not abort.
+## SDRAM layout (OS main RAM)
+
+```text
+0xC0000000  +----------------------------+
+            | FB0 + FB1                  |  FB_RESERVE = 0x2F0000
+0xC02F0000  +----------------------------+  linker RAM / MAIN_RAM_BASE
+            | .data / .bss               |
+            | bump heap →                |
+            | …                          |
+            | ← stack (64 KiB)           |
+0xC4000000  +----------------------------+
+```
+
+## QEMU load (hardware-gated)
+
+At reset, only MCU flash + internal SRAMs are in the CPU map.
+SDRAM and NOR exist as external ICs but are **invisible** until the bootloader
+runs the real init sequences (FMC bank1 + QUADSPI memory-map).
+
+```bash
+qemu-system-arm \
+  -machine stm32h745-carrier,os-image=ArmOS.elf \  # factory-program NOR array
+  -kernel bootloader.elf \                          # MCU flash @ 0x08000000
+  -serial mon:stdio -display sdl
+```
+
+| Step | What happens |
+|------|----------------|
+| Machine start | NOR array pre-programmed from `os-image` (not CPU-mapped) |
+| Bootloader | RCC AHB3ENR → FMC CLOCK/PALL/AUTOREF/LOAD → QSPI FMODE=memmap+EN |
+| After init | SDRAM @ `0xC0000000`, NOR XIP @ `0x90000000` visible |
+| Handoff | Bootloader jumps to NOR vector table |
+
+`cargo run --release` does this automatically via `scripts/qemu-run.sh`.

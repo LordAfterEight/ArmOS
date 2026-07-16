@@ -65,7 +65,14 @@ Everything the firmware does is loads/stores (or fetches) in **one physical addr
 
 **Flash alias at 0:** On a real H7, boot from flash makes the vector table available at address 0. This machine maps the same flash both at `0x08000000` and as an alias at `0`. That way the core can take the reset vector the normal Cortex-M way.
 
-**SDRAM at `0xC0000000`:** On hardware this is external DRAM behind FMC. In the machine it is simply **host RAM** mapped at that base. There is no real SDRAM timing/init model yet; the guest can read/write it immediately. That is enough for framebuffers and heap.
+**SDRAM at `0xC0000000`:** External DRAM behind FMC. **Not** mapped at reset.
+The bootloader must run the bank-1 sequence (CLOCK → PALL → AUTOREF → LOAD_MODE)
+before the guest can use it. Timing numbers are simplified (commands complete
+instantly; no refresh stalls), but the visibility gate is real.
+
+**NOR at `0x90000000`:** External QUADSPI flash. Array is factory-programmed
+from machine property `os-image=…`. **Not** in the CPU map until
+`QUADSPI_CR.EN` + `CCR.FMODE=memory-mapped`.
 
 QEMU implements this with **MemoryRegions** (ROM, RAM, MMIO) registered into the system memory map. A guest store to `0x40011028` does not hit “RAM”; it hits the USART device’s MMIO ops.
 
@@ -196,7 +203,8 @@ From the guest’s point of view it is talking to an STM32H745. From QEMU’s po
 | USART console | Functionally real enough for polling TX/RX |
 | LTDC + SDRAM framebuffer | Functionally real enough for ARGB8888 UI |
 | Clocks / baud / pixel clock | Approximate or ignored for timing |
-| FMC SDRAM controller | Skipped; RAM is just mapped |
+| FMC SDRAM controller | Gated: RCC FMCEN + full FMC AF pinmux + bank1 init |
+| QUADSPI NOR | Gated: RCC QSPIEN + QSPI AF/NCS/RESET# + CR.EN + memmap |
 | Pins, DMA, I2C, USB, CM4 | Not really modeled (stubs or absent) |
 
 The machine **works** by giving the firmware the **same register and memory contracts** it uses on hardware for the paths that matter (boot, serial, display), while omitting silicon detail that does not affect those paths yet.

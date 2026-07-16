@@ -25,9 +25,19 @@ pub extern "C" fn DefaultHandler() -> ! {
 
 unsafe fn pre_init() {
     unsafe {
+        // OS image executes from QUADSPI NOR; keep VTOR on the NOR vector table
+        // after the bootloader handoff (idempotent if already set).
+        set_vtor(0x9000_0000);
         copy_data();
         zero_bss();
         enable_fpu();
+    }
+}
+
+unsafe fn set_vtor(addr: u32) {
+    const SCB_VTOR: *mut u32 = 0xE000_ED08 as *mut u32;
+    unsafe {
+        core::ptr::write_volatile(SCB_VTOR, addr);
     }
 }
 

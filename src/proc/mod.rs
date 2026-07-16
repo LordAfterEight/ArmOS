@@ -18,7 +18,7 @@ pub trait Process {
         Self: Sized;
 
     fn on_tick(&mut self) -> Result<ProcessEvent, ProcessError>;
-    fn on_init(&self);
+    fn on_init(&mut self);
     fn on_uninit(self: Box<Self>);
 
     fn pid(&self) -> u32;

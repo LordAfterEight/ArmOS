@@ -1,6 +1,6 @@
 //! Derive USART1 kernel clock (PCLK2) from RCC at runtime.
 
-#![cfg_attr(feature = "qemu", allow(dead_code))]
+#![cfg_attr(feature = "mps2", allow(dead_code))]
 
 use super::pac;
 

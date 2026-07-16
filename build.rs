@@ -1,11 +1,10 @@
-//! Build script: linker script selection, flash artifacts, ensure custom QEMU.
+//! Build script: linker selection, flash artifacts, ensure custom QEMU.
 //!
-//! - MCU: STM32H745BIT6 (Cortex-M7)
-//! - Default: `linker.ld` (flash @ 0x08000000) for hardware and stm32h745-carrier
-//! - `mps2` feature: `linker-qemu.ld` for stock mps2-an500 + semihosting
-//!
-//! First `cargo build` / `cargo run` fetches and compiles the in-tree QEMU
-//! (qemu-stm32h745/) if it is not already available.
+//! | Binary       | Linker           | Placement                          |
+//! |--------------|------------------|------------------------------------|
+//! | `ArmOS`      | `linker.ld`      | NOR XIP @ 0x90000000, SDRAM RAM    |
+//! | `bootloader` | `linker-boot.ld` | MCU flash @ 0x08000000, DTCM RAM   |
+//! | `mps2` feat. | `linker-qemu.ld` | Legacy mps2-an500                  |
 
 use std::env;
 use std::path::PathBuf;
@@ -20,19 +19,20 @@ fn main() {
     }
 
     let mps2 = env::var("CARGO_FEATURE_MPS2").is_ok();
-    let linker = if mps2 {
-        "linker-qemu.ld"
+
+    // Per-binary link args: a package-wide `-T` would apply the same script to every bin.
+    if mps2 {
+        println!("cargo:rustc-link-arg-bins=-Tlinker-qemu.ld");
     } else {
-        "linker.ld"
-    };
-    println!("cargo:rustc-link-arg=-T{linker}");
-    println!("cargo:rerun-if-changed={linker}");
+        println!("cargo:rustc-link-arg-bin=ArmOS=-Tlinker.ld");
+        println!("cargo:rustc-link-arg-bin=bootloader=-Tlinker-boot.ld");
+    }
     println!("cargo:rerun-if-changed=linker.ld");
+    println!("cargo:rerun-if-changed=linker-boot.ld");
     println!("cargo:rerun-if-changed=linker-qemu.ld");
     println!("cargo:rerun-if-changed=qemu-stm32h745/patches");
     println!("cargo:rerun-if-changed=qemu-stm32h745/scripts/ensure-qemu.sh");
 
-    // Ensure custom QEMU for the default (non-mps2) path.
     if !mps2 && env::var("ARMOS_SKIP_QEMU_BUILD").is_err() {
         ensure_custom_qemu(&manifest_dir);
     }
@@ -42,27 +42,20 @@ fn main() {
         return;
     }
 
+    // Emit .bin/.hex for binaries in this profile dir (best-effort).
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let elf = out_dir
-        .ancestors()
-        .nth(3)
-        .expect("profile dir")
-        .join("ArmOS");
+    let profile_dir = out_dir.ancestors().nth(3).expect("profile dir");
+    let name = env::var("CARGO_BIN_NAME").unwrap_or_else(|_| "ArmOS".into());
+    let elf = profile_dir.join(&name);
 
     if !elf.exists() {
-        println!(
-            "cargo:warning=ELF not found at {} — skipping objcopy",
-            elf.display()
-        );
         return;
     }
 
     let bin = elf.with_extension("bin");
     let hex = elf.with_extension("hex");
-
     objcopy(&elf, &bin, &["-O", "binary"]);
     objcopy(&elf, &hex, &["-O", "ihex"]);
-
     println!("cargo:rerun-if-changed=build.rs");
 }
 
@@ -80,12 +73,10 @@ fn ensure_custom_qemu(manifest_dir: &std::path::Path) {
     let status = Command::new("bash").arg(&script).status();
     match status {
         Ok(s) if s.success() => {
-            println!("cargo:warning=custom QEMU ready (qemu-stm32h745/qemu/build/qemu-system-arm)");
+            println!("cargo:warning=custom QEMU ready");
         }
         Ok(s) => {
-            println!(
-                "cargo:warning=ensure-qemu.sh failed (status {s}); `cargo run` may fail until deps are installed"
-            );
+            println!("cargo:warning=ensure-qemu.sh failed (status {s})");
         }
         Err(e) => {
             println!("cargo:warning=could not run ensure-qemu.sh: {e}");
@@ -107,18 +98,10 @@ fn objcopy(elf: &PathBuf, out: &PathBuf, extra_args: &[&str]) {
             .arg(out)
             .status();
         if status.map(|s| s.success()).unwrap_or(false) {
-            println!(
-                "cargo:warning=Generated {} (flash at 0x08000000)",
-                out.display()
-            );
+            println!("cargo:warning=Generated {}", out.display());
             return;
         }
     }
-
-    println!(
-        "cargo:warning=objcopy failed for {} — install rust-objcopy/llvm-objcopy",
-        out.display()
-    );
 }
 
 fn find_llvm_tool(name: &str) -> String {
@@ -139,18 +122,7 @@ fn find_llvm_tool(name: &str) -> String {
         .expect("rustc --print sysroot");
 
     let sysroot = String::from_utf8(output.stdout).expect("sysroot utf8");
-    let host = env::var("HOST").unwrap_or_else(|_| {
-        String::from_utf8_lossy(
-            &Command::new(&rustc)
-                .arg("-vV")
-                .output()
-                .map(|o| o.stdout)
-                .unwrap_or_default(),
-        )
-        .lines()
-        .find_map(|l| l.strip_prefix("host: ").map(|s| s.to_string()))
-        .unwrap_or_else(|| "x86_64-unknown-linux-gnu".into())
-    });
+    let host = env::var("HOST").unwrap_or_else(|_| "x86_64-unknown-linux-gnu".into());
     let tool = PathBuf::from(sysroot.trim())
         .join("lib/rustlib")
         .join(host)

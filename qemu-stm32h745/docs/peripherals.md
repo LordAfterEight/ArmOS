@@ -7,7 +7,8 @@
 | RCC | 1–2 | Minimal | HSI/HSE/PLL1 ready; ENR/CFGR storage |
 | GPIO | 1 | Minimal | MODER, AFR, ODR, BSRR, IDR |
 | USART1 | 1 | Done (poll) | CR1/BRR/ISR/TDR/RDR → chardev |
-| FMC / SDRAM | 3 | RAM only | 64 MiB at `0xC0000000`; FMC regs stub |
+| FMC / SDRAM | 3 | Gated | Bank1 init seq → map 64 MiB @ `0xC0000000` |
+| QUADSPI / NOR | 3 | Gated | CR.EN + FMODE=memmap → map 128 MiB @ `0x90000000` |
 | LTDC | 4 | Done (layer 1) | ARGB8888 scanout → QEMU console (~30 Hz) |
 | I2C3 | 5 | Stub | Placeholder |
 | TIM / PWM | 6 | Stub | Placeholder |
