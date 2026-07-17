@@ -9,6 +9,7 @@ Source: KiCad netlist `STM32H745 'Computer'.net` (2026-07-14), Revision 1.0.
 | Part | **STM32H745BITx** (U1, LQFP208) — BIT package, 2 MiB flash |
 | Primary core | Cortex-M7 (CM4 later) |
 | HSE | 8 MHz (`616L3I008M00000R`) |
+| Target SYSCLK | **480 MHz** (PLL1 from HSE; QEMU wires this as `cpuclk`) |
 
 ## Status LEDs (carrier)
 
@@ -21,7 +22,8 @@ Source: KiCad netlist `STM32H745 'Computer'.net` (2026-07-14), Revision 1.0.
 
 QEMU opens a **second window** (`stm32h745-status-leds`) driven by these GPIO outputs.
 
-Bootloader: DBG while bring-up → RUN if OS vectors OK → ERR blink + red panel if NOR image invalid.
+Bootloader: DBG while bring-up → RUN if OS vectors OK → ERR blink + black/red
+fail panel (title, reason, MSP/RESET) if NOR has no bootable image.
 
 ## Debug — J4 (`Conn_ARM_JTAG_SWD_10`)
 

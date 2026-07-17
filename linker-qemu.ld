@@ -1,7 +1,7 @@
 /* Legacy mps2-an500 + PSRAM stand-in for SDRAM experiments.
  * Prefer default build + stm32h745-carrier for real layout.
  *
- * Heap symbols required by lib.rs bump allocator.
+ * Heap symbols required by the free-list allocator.
  */
 ENTRY(Reset)
 

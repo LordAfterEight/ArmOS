@@ -25,11 +25,13 @@ The machine creates the SoC, configures board properties, then loads firmware. A
 
 ### 1. Machine init (`stm32h745_carrier`)
 
-1. Create a fixed **SYSCLK** object (default **64 MHz**, HSI-class).
+1. Create a fixed **SYSCLK** object at the carrier full-speed point:
+   **480 MHz** (HSE 8 MHz → PLL1 on silicon; QEMU wires the post-PLL rate).
 2. Create `stm32h745-soc` and set:
    - `hse-frequency = 8_000_000` (carrier crystal)
    - `sdram-size = 64 MiB`
 3. Connect SYSCLK into the SoC and **realize** it (build the whole chip).
+   SysTick **refclk** = SYSCLK / 8 → **60 MHz** (HCLK/8 with no AHB prescale).
 4. Call **`armv7m_load_kernel`**: parse the ELF, place segments into flash, prepare Cortex-M reset (MSP/PC from the vector table).
 
 ### 2. SoC realize (`stm32h745_soc`)
@@ -89,6 +91,29 @@ Once running:
    - **MMIO** → C `read`/`write` callbacks on that device
 4. Exceptions/IRQs go through the **NVIC** model (stock QEMU ARMv7-M).
 5. SysTick / virtual time advance with QEMU’s clock; devices can schedule timers (LTDC refresh does this).
+
+### Guest MHz vs how fast it feels on the host
+
+Wiring **SYSCLK = 480 MHz** only sets the **virtual** CPU/SysTick frequency. By
+default TCG still executes guest code **as fast as the host can** — changing
+64 MHz → 480 MHz alone does **not** change wall-clock UI speed.
+
+Optional wall-clock pacing via the runner:
+
+```bash
+ARMOS_QEMU_ICOUNT=shift=1,align=on cargo run --release
+```
+
+| Piece | Meaning |
+|-------|---------|
+| `shift=1` | Each guest insn advances **2 ns** of virtual time ≈ **500 MHz** |
+| `align=on` | Try to keep virtual time ≤ wall clock |
+
+**`align=on` needs the host to sustain ~that many guest MIPS.** With SDL/UI work,
+TCG often cannot; QEMU then spams *“The guest is now late by …”* and runs at
+full speed anyway — so you get the warning without useful throttling. Default
+is **no icount** (quiet, max TCG). For softer real-time without spam, raise
+`shift` (e.g. `shift=4,align=on` ≈ 62 MHz target).
 
 There is no separate “simulator for the OS.” The firmware binary **is** the guest; the machine only supplies the silicon-shaped world it expects.
 
@@ -202,7 +227,8 @@ From the guest’s point of view it is talking to an STM32H745. From QEMU’s po
 | Address map for used regions | Matches H745 / carrier choices |
 | USART console | Functionally real enough for polling TX/RX |
 | LTDC + SDRAM framebuffer | Functionally real enough for ARGB8888 UI |
-| Clocks / baud / pixel clock | Approximate or ignored for timing |
+| CPU / SysTick clock | Fixed **480 MHz** SYSCLK (not live PLL from RCC) |
+| Clocks / baud / pixel clock | Guest should assume 480 MHz; USART host I/O ignores bit timing |
 | FMC SDRAM controller | Gated: RCC FMCEN + full FMC AF pinmux + bank1 init |
 | QUADSPI NOR | Gated: RCC QSPIEN + QSPI AF/NCS/RESET# + CR.EN + memmap |
 | Pins, DMA, I2C, USB, CM4 | Not really modeled (stubs or absent) |

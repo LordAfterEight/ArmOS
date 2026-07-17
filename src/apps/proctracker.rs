@@ -67,6 +67,7 @@ impl crate::proc::Process for ProcessTracker {
         if !self.tick_count.is_multiple_of(self.report_every) {
             return Ok(ProcessEvent::Yielded);
         }
+        crate::board::gpio::PE3.into_output().toggle();
         crate::klog::log(
             self.name,
             &format!("Ticks: {}", self.tick_count),

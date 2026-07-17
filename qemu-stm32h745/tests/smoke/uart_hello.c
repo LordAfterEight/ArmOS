@@ -64,8 +64,9 @@ void Reset_Handler(void)
     GPIOA_MODER = (GPIOA_MODER & ~(3u << 18)) | (2u << 18);
     GPIOA_AFRH = (GPIOA_AFRH & ~(0xFu << 4)) | (7u << 4);
 
-    /* 115200-ish at 64 MHz PCLK: BRR = 64000000/115200 ≈ 555 */
-    USART1_BRR = 555u;
+    /* 115200-ish at 480 MHz PCLK: BRR = 480000000/115200 ≈ 4167.
+     * Host chardev ignores bit timing; value only needs to be non-zero. */
+    USART1_BRR = 4167u;
     USART1_CR1 = (1u << 0) | (1u << 3); /* UE | TE */
 
     uart_puts("OK\r\n");

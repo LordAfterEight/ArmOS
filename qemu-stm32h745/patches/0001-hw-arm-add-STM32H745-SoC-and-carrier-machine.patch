@@ -97,9 +97,14 @@ index 0000000..a0647e2
 +#include "hw/arm/boot.h"
 +#include "qemu/error-report.h"
 +
-+/* HSI default 64 MHz until guest programs PLLs. */
-+#define SYSCLK_FRQ 64000000ULL
-+#define HSE_FRQ    8000000ULL
++/*
++ * Carrier target clocks (match silicon after PLL bring-up):
++ *   HSE 8 MHz → PLL1 → SYSCLK / CPU 480 MHz.
++ * QEMU does not recompute PLLs from RCC yet; the board wires the
++ * post-PLL operating point so SysTick and virtual timers match 480 MHz.
++ */
++#define SYSCLK_FRQ 480000000ULL
++#define HSE_FRQ      8000000ULL
 +
 +static void stm32h745_carrier_init(MachineState *machine)
 +{

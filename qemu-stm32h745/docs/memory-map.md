@@ -31,7 +31,7 @@
             | FB0 + FB1                  |  FB_RESERVE = 0x2F0000
 0xC02F0000  +----------------------------+  linker RAM / MAIN_RAM_BASE
             | .data / .bss               |
-            | bump heap →                |
+            | free-list heap             |
             | …                          |
             | ← stack (64 KiB)           |
 0xC4000000  +----------------------------+

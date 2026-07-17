@@ -9,11 +9,12 @@
 //! 3. Enable FMC + QUADSPI clocks (RCC AHB3ENR)
 //! 4. FMC SDRAM bank1 init: CLOCK → PALL → AUTOREF → LOAD_MODE
 //! 5. QUADSPI memory-mapped mode (DCR.FSIZE, CCR.FMODE=11, CR.EN)
-//! 6. Validate NOR vectors; if bad → ERR LED + red LTDC screen, never jump
+//! 6. Validate NOR vectors; if bad → ERR LED + LTDC fail UI (text), never jump
 //! 7. Else RUN LED on, jump to ArmOS @ 0x90000000
 //!
 //! Board: STM32H745BITx + IS25LP01GJ (QSPI) + AS4C32M16SB (FMC SDRAM).
 //! Status LEDs (anode ← GPIO, active high): PE2=RUN PE3=DBG PE4=ERR PE5=PNC.
+//! Fail panel: SDRAM FB @ 0xC0000000 + LTDC layer 1 (tiny 5×7 font, no OS deps).
 
 #![no_std]
 #![no_main]
@@ -303,27 +304,156 @@ unsafe fn ltdc_w(off: usize, val: u32) {
     }
 }
 
-/// Solid red frame + LTDC enable so a failed NOR load is obvious on the panel.
-/// Timing matches the OS driver (800×480); no fonts in the bootloader.
-unsafe fn show_os_load_fail_screen() {
-    unsafe {
-        // Fill front buffer in SDRAM (must already be mapped).
-        let fb = FB_BASE as *mut u32;
-        let pixels = (FB_W * FB_H) as usize;
-        let red = 0x00C0_0020u32;
-        let band = 0x00FF_4040u32;
-        for i in 0..pixels {
-            let y = (i as u32) / FB_W;
-            // Horizontal stripe so it is not a flat “dead” window.
-            let c = if (y / 40) % 2 == 0 { red } else { band };
-            core::ptr::write_volatile(fb.add(i), c);
-        }
+/* ── Fail-panel drawing (SDRAM FB; no heap / no OS fonts) ────────── */
 
+const COL_BLACK: u32 = 0x0000_0000;
+const COL_RED: u32 = 0x00FF_0000;
+
+/// 5×7 glyphs, column-major, bit0 = top. Index = ASCII - 0x20 for 0x20..=0x5F.
+/// Missing glyphs render as a solid block.
+#[rustfmt::skip]
+const FONT5X7: [[u8; 5]; 64] = [
+    // sp ! " # $ % & ' ( ) * + , - . /
+    [0x00,0x00,0x00,0x00,0x00], [0x00,0x00,0x5F,0x00,0x00], [0x00,0x07,0x00,0x07,0x00],
+    [0x14,0x7F,0x14,0x7F,0x14], [0x24,0x2A,0x7F,0x2A,0x12], [0x23,0x13,0x08,0x64,0x62],
+    [0x36,0x49,0x55,0x22,0x50], [0x00,0x05,0x03,0x00,0x00], [0x00,0x1C,0x22,0x41,0x00],
+    [0x00,0x41,0x22,0x1C,0x00], [0x14,0x08,0x3E,0x08,0x14], [0x08,0x08,0x3E,0x08,0x08],
+    [0x00,0x50,0x30,0x00,0x00], [0x08,0x08,0x08,0x08,0x08], [0x00,0x60,0x60,0x00,0x00],
+    [0x20,0x10,0x08,0x04,0x02],
+    // 0-9
+    [0x3E,0x51,0x49,0x45,0x3E], [0x00,0x42,0x7F,0x40,0x00], [0x42,0x61,0x51,0x49,0x46],
+    [0x21,0x41,0x45,0x4B,0x31], [0x18,0x14,0x12,0x7F,0x10], [0x27,0x45,0x45,0x45,0x39],
+    [0x3C,0x4A,0x49,0x49,0x30], [0x01,0x71,0x09,0x05,0x03], [0x36,0x49,0x49,0x49,0x36],
+    [0x06,0x49,0x49,0x29,0x1E],
+    // : ; < = > ? @
+    [0x00,0x36,0x36,0x00,0x00], [0x00,0x56,0x36,0x00,0x00], [0x08,0x14,0x22,0x41,0x00],
+    [0x14,0x14,0x14,0x14,0x14], [0x00,0x41,0x22,0x14,0x08], [0x02,0x01,0x51,0x09,0x06],
+    [0x32,0x49,0x79,0x41,0x3E],
+    // A-Z
+    [0x7E,0x11,0x11,0x11,0x7E], [0x7F,0x49,0x49,0x49,0x36], [0x3E,0x41,0x41,0x41,0x22],
+    [0x7F,0x41,0x41,0x22,0x1C], [0x7F,0x49,0x49,0x49,0x41], [0x7F,0x09,0x09,0x09,0x01],
+    [0x3E,0x41,0x49,0x49,0x7A], [0x7F,0x08,0x08,0x08,0x7F], [0x00,0x41,0x7F,0x41,0x00],
+    [0x20,0x40,0x41,0x3F,0x01], [0x7F,0x08,0x14,0x22,0x41], [0x7F,0x40,0x40,0x40,0x40],
+    [0x7F,0x02,0x0C,0x02,0x7F], [0x7F,0x04,0x08,0x10,0x7F], [0x3E,0x41,0x41,0x41,0x3E],
+    [0x7F,0x09,0x09,0x09,0x06], [0x3E,0x41,0x51,0x21,0x5E], [0x7F,0x09,0x19,0x29,0x46],
+    [0x46,0x49,0x49,0x49,0x31], [0x01,0x01,0x7F,0x01,0x01], [0x3F,0x40,0x40,0x40,0x3F],
+    [0x1F,0x20,0x40,0x20,0x1F], [0x3F,0x40,0x38,0x40,0x3F], [0x63,0x14,0x08,0x14,0x63],
+    [0x07,0x08,0x70,0x08,0x07], [0x61,0x51,0x49,0x45,0x43],
+    // [ \ ] ^ _ 
+    [0x00,0x7F,0x41,0x41,0x00], [0x02,0x04,0x08,0x10,0x20], [0x00,0x41,0x41,0x7F,0x00],
+    [0x04,0x02,0x01,0x02,0x04], [0x40,0x40,0x40,0x40,0x40],
+];
+
+#[inline(always)]
+unsafe fn fb_put(x: u32, y: u32, color: u32) {
+    if x < FB_W && y < FB_H {
+        let i = (y * FB_W + x) as usize;
+        unsafe {
+            core::ptr::write_volatile((FB_BASE as *mut u32).add(i), color);
+        }
+    }
+}
+
+unsafe fn fb_fill(x: u32, y: u32, w: u32, h: u32, color: u32) {
+    let x1 = x.saturating_add(w).min(FB_W);
+    let y1 = y.saturating_add(h).min(FB_H);
+    let mut yy = y.min(FB_H);
+    while yy < y1 {
+        let mut xx = x.min(FB_W);
+        while xx < x1 {
+            unsafe { fb_put(xx, yy, color) };
+            xx += 1;
+        }
+        yy += 1;
+    }
+}
+
+unsafe fn fb_fill_screen(color: u32) {
+    unsafe {
+        fb_fill(0, 0, FB_W, FB_H, color);
+    }
+}
+
+fn glyph5x7(c: u8) -> [u8; 5] {
+    let u = if (b'a'..=b'z').contains(&c) {
+        c - (b'a' - b'A')
+    } else {
+        c
+    };
+    if (0x20..=0x5F).contains(&u) {
+        FONT5X7[(u - 0x20) as usize]
+    } else {
+        [0x7F, 0x41, 0x41, 0x41, 0x7F] // box for unknown
+    }
+}
+
+/// Draw `text` with integer scale (pixel size of each font bit).
+unsafe fn fb_draw_text(mut x: u32, y: u32, text: &[u8], scale: u32, color: u32) {
+    let scale = scale.max(1);
+    for &c in text {
+        if c == b'\n' {
+            continue;
+        }
+        let g = glyph5x7(c);
+        for (col, bits) in g.iter().enumerate() {
+            for row in 0..7u32 {
+                if bits & (1 << row) != 0 {
+                    unsafe {
+                        fb_fill(
+                            x + col as u32 * scale,
+                            y + row * scale,
+                            scale,
+                            scale,
+                            color,
+                        );
+                    }
+                }
+            }
+        }
+        // 5 px glyph + 1 px gap
+        x = x.saturating_add(6 * scale);
+        if x >= FB_W {
+            break;
+        }
+    }
+}
+
+fn hex_u32(v: u32, out: &mut [u8; 10]) {
+    out[0] = b'0';
+    out[1] = b'x';
+    const H: &[u8; 16] = b"0123456789ABCDEF";
+    for i in 0..8 {
+        out[2 + i] = H[((v >> (28 - i * 4)) & 0xF) as usize];
+    }
+}
+
+fn fail_reason(msp: u32, reset: u32) -> &'static [u8] {
+    let erased = msp == 0xFFFF_FFFF && reset == 0xFFFF_FFFF;
+    let mostly_erased = msp == 0 || msp == 0xFFFF_FFFF || reset == 0 || reset == 0xFFFF_FFFF;
+    if erased || mostly_erased {
+        return b"NOR empty or erased (no image)";
+    }
+    let msp_ok = (0xC000_0000..=0xC400_0000).contains(&msp) && (msp & 7) == 0;
+    if !msp_ok {
+        return b"Invalid MSP (need SDRAM stack)";
+    }
+    if reset & 1 == 0 {
+        return b"Reset vector missing Thumb bit";
+    }
+    let thr = reset & !1;
+    if !(0x9000_0000..0x9800_0000).contains(&thr) {
+        return b"Reset vector not in NOR XIP";
+    }
+    b"Vector table rejected"
+}
+
+/// Program LTDC layer 1 to scan the SDRAM framebuffer (same timing as OS).
+unsafe fn ltdc_enable_fb() {
+    unsafe {
         let apb3 = reg_read(RCC_APB3ENR);
         reg_write(RCC_APB3ENR, apb3 | RCC_APB3ENR_LTDCEN);
         let _ = reg_read(RCC_APB3ENR);
 
-        // Same (N-1) timing encoding as ArmOS ltdc driver.
         let hsync = 48u32;
         let hbp = 40u32;
         let hfp = 40u32;
@@ -361,7 +491,32 @@ unsafe fn show_os_load_fail_screen() {
         ltdc_w(0xB4, FB_H); // L1CFBLNR
         ltdc_w(0x84, 1); // L1CR LEN
         ltdc_w(0x24, 1); // SRCR IMR
-        ltdc_w(0x18, 0x2221); // GCR LTDCEN | reset defaults
+        ltdc_w(0x18, 0x2221); // GCR LTDCEN
+        ltdc_w(0x24, 1); // reload again after enable (QEMU scanout)
+    }
+}
+
+/// Full-screen fail UI when NOR has no bootable ArmOS image.
+/// Black background, red text only — no chrome.
+unsafe fn show_os_load_fail_screen(msp: u32, reset: u32) {
+    unsafe {
+        fb_fill_screen(COL_BLACK);
+
+        fb_draw_text(40, 120, b"BOOT FAILED", 5, COL_RED);
+        fb_draw_text(40, 200, b"No bootable OS on NOR flash", 2, COL_RED);
+        fb_draw_text(40, 250, fail_reason(msp, reset), 2, COL_RED);
+
+        let mut hex = [0u8; 10];
+        let label_w = 6u32 * 6 * 2;
+        hex_u32(msp, &mut hex);
+        fb_draw_text(40, 310, b"MSP   ", 2, COL_RED);
+        fb_draw_text(40 + label_w, 310, &hex, 2, COL_RED);
+
+        hex_u32(reset, &mut hex);
+        fb_draw_text(40, 350, b"RESET ", 2, COL_RED);
+        fb_draw_text(40 + label_w, 350, &hex, 2, COL_RED);
+
+        ltdc_enable_fb();
     }
 }
 
@@ -376,13 +531,13 @@ fn os_vectors_look_valid(msp: u32, reset: u32) -> bool {
 }
 
 /// Fatal: bad/empty NOR image. Stay in bootloader with ERR LED + panel.
-unsafe fn halt_os_load_failed() -> ! {
+unsafe fn halt_os_load_failed(msp: u32, reset: u32) -> ! {
     unsafe {
         led_set(LED_RUN, false);
         led_set(LED_DBG, false);
         led_set(LED_ERR, true);
         led_set(LED_PNC, false);
-        show_os_load_fail_screen();
+        show_os_load_fail_screen(msp, reset);
         loop {
             // Slow blink ERR so a stuck boot is visible on the LED window too.
             led_set(LED_ERR, true);
@@ -463,7 +618,7 @@ unsafe fn jump_to_os() -> ! {
         let reset = core::ptr::read_volatile(vtor.add(1));
 
         if !os_vectors_look_valid(msp, reset) {
-            halt_os_load_failed();
+            halt_os_load_failed(msp, reset);
         }
 
         led_set(LED_DBG, false);

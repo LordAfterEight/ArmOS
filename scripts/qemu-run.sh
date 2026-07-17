@@ -5,6 +5,16 @@
 #   -machine stm32h745-carrier,os-image=ArmOS.elf
 #
 # Bootloader must enable FMC + QUADSPI before the OS image is visible/usable.
+#
+# Timing (important):
+#   Machine SYSCLK is 480 MHz (virtual CPU/SysTick). That does NOT throttle how
+#   fast TCG runs on the host — by default the guest is unrestricted TCG.
+#
+#   Optional wall-clock pacing (often too optimistic on a laptop + SDL):
+#     ARMOS_QEMU_ICOUNT=shift=1,align=on   # ~480 MHz real-time target
+#   With align=on, if the host cannot sustain that rate QEMU prints
+#   "The guest is now late by …" and runs full-speed anyway (no useful throttle).
+#   Prefer a larger shift if you want align without spam, e.g. shift=4 (~62 MHz).
 
 set -euo pipefail
 
@@ -13,6 +23,19 @@ shift || true
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROFILE_DIR="$(dirname "${BIN}")"
+
+# Default off: unrestricted TCG, no "guest is late" spam from align=on.
+icount_args() {
+  local spec="${ARMOS_QEMU_ICOUNT:-off}"
+  case "${spec}" in
+    ""|off|OFF|max|none|disable|disabled)
+      return 0
+      ;;
+    *)
+      printf '%s\n' "-icount" "${spec}"
+      ;;
+  esac
+}
 
 has_vma() {
   local pattern="$1"
@@ -93,26 +116,38 @@ run_carrier() {
     *) display_args=(-display "${ARMOS_QEMU_DISPLAY}") ;;
   esac
 
+  local icount=()
+  # shellcheck disable=SC2207
+  mapfile -t icount < <(icount_args)
+
   if has_vma '0x0*90000000'; then
     local bootloader
     bootloader="$(ensure_bootloader)"
     echo "==> stm32h745-carrier (hardware-gated NOR/SDRAM)" >&2
     echo "    bootloader: ${bootloader}" >&2
     echo "    os-image:   ${BIN}" >&2
+    if ((${#icount[@]})); then
+      echo "    icount:     ${icount[*]}" >&2
+    fi
     exec "${qemu_bin}" \
       -machine "stm32h745-carrier,os-image=${BIN}" \
       -kernel "${bootloader}" \
       -serial mon:stdio \
       "${display_args[@]}" \
+      "${icount[@]}" \
       "$@"
   fi
 
   echo "==> stm32h745-carrier: -kernel ${BIN} (no NOR XIP VMA)" >&2
+  if ((${#icount[@]})); then
+    echo "    icount:     ${icount[*]}" >&2
+  fi
   exec "${qemu_bin}" \
     -machine stm32h745-carrier \
     -kernel "${BIN}" \
     -serial mon:stdio \
     "${display_args[@]}" \
+    "${icount[@]}" \
     "$@"
 }
 

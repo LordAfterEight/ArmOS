@@ -43,14 +43,17 @@ Without root, `qemu-stm32h745/scripts/bootstrap-deps.sh` can stage headers into 
 | `cargo hw` | Release OS image (for NOR programming) |
 | `cargo mps2` | Legacy `mps2-an500` + semihosting |
 | `ARMOS_QEMU_DISPLAY=none cargo run --release` | Headless |
+| `ARMOS_QEMU_ICOUNT=shift=1,align=on cargo run --release` | Try real-time ~480 MHz (warns if host can’t keep up) |
+| `./qemu-stm32h745/scripts/install-global.sh` | Install `qemu-system-arm` → `~/.local/bin` (carrier machine) |
 
 ### Manual QEMU (any OS ELF linked for NOR)
 
 ```bash
-./qemu-stm32h745/scripts/ensure-qemu.sh
-export LD_LIBRARY_PATH="$PWD/qemu-stm32h745/.deps/prefix/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Once: put ArmOS QEMU on PATH (stm32h745-carrier)
+./qemu-stm32h745/scripts/install-global.sh
+# new shell, or: export PATH="$HOME/.local/bin:$PATH"
 
-qemu-stm32h745/qemu/build/qemu-system-arm \
+qemu-system-arm \
   -machine stm32h745-carrier,os-image=target/thumbv7em-none-eabihf/release/ArmOS \
   -kernel target/thumbv7em-none-eabihf/release/bootloader \
   -serial mon:stdio -display sdl

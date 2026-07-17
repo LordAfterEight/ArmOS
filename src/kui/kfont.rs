@@ -1,7 +1,7 @@
 //! Font assets — fontdue faces embedded from `assets/fonts/`.
 //!
 //! Only fonts required for boot chrome / ProcessTracker are loaded in `init`
-//! to stay within the bump-heap budget. Others load on first use via `ensure_*`.
+//! to keep heap use modest at boot. Others load on first use via `ensure_*`.
 
 use spin::Once;
 

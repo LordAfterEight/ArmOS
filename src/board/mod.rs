@@ -47,8 +47,15 @@ pub const USART1_RX: GpioPin = GpioPin {
 
 pub const UART_BAUD: u32 = 115_200;
 
-/// External HSE frequency in Hz, when populated on the carrier board.
-pub const HSE_FREQ_HZ: Option<u32> = None;
+/// External HSE (OSC_IN) — carrier crystal `616L3I008M00000R`.
+pub const HSE_FREQ_HZ: u32 = 8_000_000;
+
+/// Target system clock after PLL1 bring-up (HSE → 480 MHz on CM7).
+///
+/// QEMU `stm32h745-carrier` wires this as SYSCLK/cpuclk so SysTick and
+/// virtual timers match the silicon operating point. Guest code should use
+/// this (via `hal::clock`) rather than assuming reset HSI (64 MHz).
+pub const SYSCLK_FREQ_HZ: u32 = 480_000_000;
 
 // ---------------------------------------------------------------------------
 // Carrier memory map (confirm against schematic)
